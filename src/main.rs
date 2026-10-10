@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use chrono::{DateTime, Local};
 use humansize::{format_size, BINARY};
+use std::sync::Arc;
+
+mod sftp_client;
+mod messages;
 
 #[derive(Clone, PartialEq)]
 enum VfsType {
@@ -37,22 +41,58 @@ struct PaneState {
     files: Vec<FileEntry>,
     selected_index: usize,
     connection_string: String,
+    
+    // SFTP State
+    sftp_session: Option<Arc<tokio::sync::Mutex<russh_sftp::client::SftpSession>>>,
+    loading: bool,
+    error_msg: Option<String>,
+    
+    // Communication
+    tx: crossbeam_channel::Sender<messages::PaneMessage>,
+    rx: crossbeam_channel::Receiver<messages::PaneMessage>,
 }
 
 impl PaneState {
     fn new(path: impl AsRef<Path>) -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
         let mut state = Self {
             vfs_type: VfsType::Local,
             current_path: path.as_ref().to_path_buf(),
             files: Vec::new(),
             selected_index: 0,
             connection_string: "".to_string(),
+            sftp_session: None,
+            loading: false,
+            error_msg: None,
+            tx,
+            rx,
         };
         state.refresh();
         state
     }
 
     fn refresh(&mut self) {
+        if self.vfs_type == VfsType::Sftp {
+            if let Some(session) = &self.sftp_session {
+                self.loading = true;
+                let tx = self.tx.clone();
+                let path = self.current_path.to_string_lossy().into_owned();
+                let path = if path.is_empty() { ".".to_string() } else { path };
+                
+                // We must be careful because sftp_session is locked
+                let session = Arc::clone(session);
+                tokio::spawn(async move {
+                    let sftp = session.lock().await;
+                    if let Ok(files) = crate::sftp_client::list_sftp_dir(&sftp, &path).await {
+                        let _ = tx.send(messages::PaneMessage::FilesFetched(files));
+                    } else {
+                        let _ = tx.send(messages::PaneMessage::SftpError("Failed to list dir".into()));
+                    }
+                });
+            }
+            return;
+        }
+
         if self.vfs_type != VfsType::Local {
             // Placeholder for remote VFS refresh
             self.files.clear();
@@ -144,6 +184,12 @@ struct FaroCommander {
     
     show_delete_dialog: bool,
     delete_path: String,
+    
+    // SSH Terminal
+    show_ssh_terminal: bool,
+    ssh_host: String,
+    ssh_output: String,
+    ssh_input: String,
 }
 
 impl Default for FaroCommander {
@@ -162,6 +208,10 @@ impl Default for FaroCommander {
             mkdir_path: "".to_string(),
             show_delete_dialog: false,
             delete_path: "".to_string(),
+            show_ssh_terminal: false,
+            ssh_host: "".to_string(),
+            ssh_output: "Welcome to FaroCommander SSH Terminal.\n".to_string(),
+            ssh_input: "".to_string(),
         }
     }
 }
@@ -346,9 +396,47 @@ impl eframe::App for FaroCommander {
                 ui.menu_button("Net", |ui| {
                     let _ = ui.button("FTP Connect...");
                     let _ = ui.button("FTP New Connection...");
+                    if ui.button("SSH Terminal").clicked() {
+                        self.show_ssh_terminal = true;
+                    }
                 });
             });
         });
+
+        if self.show_ssh_terminal {
+            egui::Window::new("SSH Terminal")
+                .open(&mut self.show_ssh_terminal)
+                .default_width(600.0)
+                .default_height(400.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Connection (user:pass@host:port):");
+                        ui.add(egui::TextEdit::singleline(&mut self.ssh_host));
+                        if ui.button("Connect").clicked() {
+                            self.ssh_output.push_str("\nConnecting...\n");
+                            // TODO: Dispatch tokio task to connect SSH
+                        }
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height(300.0).stick_to_bottom(true).show(ui, |ui| {
+                        ui.add_sized(
+                            [ui.available_width(), 300.0],
+                            egui::TextEdit::multiline(&mut self.ssh_output).interactive(false)
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(">");
+                        let res = ui.add_sized([ui.available_width() - 50.0, 20.0], egui::TextEdit::singleline(&mut self.ssh_input));
+                        if res.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            let cmd = self.ssh_input.clone();
+                            self.ssh_input.clear();
+                            self.ssh_output.push_str(&format!("> {}\n", cmd));
+                            // // TODO: Send to SSH session
+                            res.request_focus();
+                        }
+                    });
+                });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let half_width = ui.available_width() / 2.0;
@@ -443,6 +531,25 @@ impl FaroCommander {
             &mut self.right_pane
         };
 
+        // Process async messages
+        while let Ok(msg) = pane.rx.try_recv() {
+            match msg {
+                messages::PaneMessage::SftpConnected(sftp) => {
+                    pane.sftp_session = Some(Arc::new(tokio::sync::Mutex::new(sftp)));
+                    pane.loading = false;
+                    pane.refresh();
+                }
+                messages::PaneMessage::SftpError(err) => {
+                    pane.error_msg = Some(err);
+                    pane.loading = false;
+                }
+                messages::PaneMessage::FilesFetched(files) => {
+                    pane.files = files;
+                    pane.loading = false;
+                }
+            }
+        }
+
         // Draw a frame around the pane to fill the area completely
         let frame = egui::Frame::none()
             .fill(ui.visuals().panel_fill)
@@ -454,6 +561,8 @@ impl FaroCommander {
             });
 
         frame.show(ui, |ui| {
+            ui.set_min_height(ui.available_height());
+            ui.set_min_width(ui.available_width());
             ui.vertical(|ui| {
                 // Drive / VFS selector
                 ui.horizontal_wrapped(|ui| {
@@ -471,10 +580,42 @@ impl FaroCommander {
                         });
 
                     if pane.vfs_type != VfsType::Local {
-                        ui.add(egui::TextEdit::singleline(&mut pane.connection_string).hint_text("user:pass@host:port/path"));
+                        ui.add(egui::TextEdit::singleline(&mut pane.connection_string).hint_text("user:pass@host:port"));
                         if ui.button("Connect").clicked() {
-                            // TODO: Implement connection via OpenDAL
-                            pane.refresh();
+                            if pane.vfs_type == VfsType::Sftp {
+                                pane.loading = true;
+                                pane.error_msg = None;
+                                let tx = pane.tx.clone();
+                                
+                                // parse user:pass@host:port
+                                let conn = pane.connection_string.clone();
+                                tokio::spawn(async move {
+                                    if let Ok(url) = url::Url::parse(&format!("sftp://{}", conn)) {
+                                        let host = url.host_str().unwrap_or("localhost");
+                                        let port = url.port().unwrap_or(22);
+                                        let user = url.username();
+                                        let pass = url.password().unwrap_or("");
+                                        
+                                        match crate::sftp_client::connect_sftp(host, port, user, pass).await {
+                                            Ok((_session, sftp)) => {
+                                                let _ = tx.send(messages::PaneMessage::SftpConnected(sftp));
+                                            }
+                                            Err(e) => {
+                                                let _ = tx.send(messages::PaneMessage::SftpError(e));
+                                            }
+                                        }
+                                    } else {
+                                        let _ = tx.send(messages::PaneMessage::SftpError("Invalid URI format".to_string()));
+                                    }
+                                });
+                            }
+                        }
+                        
+                        if pane.loading {
+                            ui.spinner();
+                        }
+                        if let Some(err) = &pane.error_msg {
+                            ui.colored_label(egui::Color32::RED, err);
                         }
                     } else {
                         // Dynamic Windows Drives
