@@ -306,15 +306,20 @@ impl eframe::App for FaroCommander {
         egui::TopBottomPanel::bottom("bottom_panel")
             .frame(bottom_frame)
             .show(ctx, |ui| {
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_justify(true), |ui| {
+                ui.horizontal(|ui| {
                     let h = 28.0;
-                    if ui.add_sized([0.0, h], egui::Button::new("F3 View")).clicked() { trigger_f3 = true; }
-                    if ui.add_sized([0.0, h], egui::Button::new("F4 Edit")).clicked() { trigger_f4 = true; }
-                    if ui.add_sized([0.0, h], egui::Button::new("F5 Copy")).clicked() { trigger_f5 = true; }
-                    if ui.add_sized([0.0, h], egui::Button::new("F6 RenMov")).clicked() { trigger_f6 = true; }
-                    if ui.add_sized([0.0, h], egui::Button::new("F7 Mkdir")).clicked() { trigger_f7 = true; }
-                    if ui.add_sized([0.0, h], egui::Button::new("F8 Delete")).clicked() { trigger_f8 = true; }
-                    if ui.add_sized([0.0, h], egui::Button::new("Alt+F4 Exit")).clicked() { trigger_exit = true; }
+                    let spacing = ui.spacing().item_spacing.x;
+                    let num_buttons = 7.0;
+                    let total_spacing = spacing * (num_buttons - 1.0);
+                    let button_width = (ui.available_width() - total_spacing) / num_buttons;
+                    
+                    if ui.add_sized([button_width, h], egui::Button::new("F3 View")).clicked() { trigger_f3 = true; }
+                    if ui.add_sized([button_width, h], egui::Button::new("F4 Edit")).clicked() { trigger_f4 = true; }
+                    if ui.add_sized([button_width, h], egui::Button::new("F5 Copy")).clicked() { trigger_f5 = true; }
+                    if ui.add_sized([button_width, h], egui::Button::new("F6 RenMov")).clicked() { trigger_f6 = true; }
+                    if ui.add_sized([button_width, h], egui::Button::new("F7 Mkdir")).clicked() { trigger_f7 = true; }
+                    if ui.add_sized([button_width, h], egui::Button::new("F8 Delete")).clicked() { trigger_f8 = true; }
+                    if ui.add_sized([button_width, h], egui::Button::new("Alt+F4 Exit")).clicked() { trigger_exit = true; }
                 });
             });
 
