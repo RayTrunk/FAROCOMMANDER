@@ -18,3 +18,5 @@ egui_extras = "0.27.2"
 russh = { git = "https://github.com/Eugeny/russh.git", version = "0.64.1" }
 russh-sftp = "3.0.1"
 url = "2.5.8"
+futures = "0.3.34"
+rustls = { version = "0.23.45", features = ["ring"] }

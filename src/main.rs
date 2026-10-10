@@ -6,6 +6,7 @@ use humansize::{format_size, BINARY};
 use std::sync::Arc;
 
 mod sftp_client;
+mod ssh_client;
 mod messages;
 
 #[derive(Clone, PartialEq)]
@@ -44,6 +45,7 @@ struct PaneState {
     
     // SFTP State
     sftp_session: Option<Arc<tokio::sync::Mutex<russh_sftp::client::SftpSession>>>,
+    opendal_op: Option<opendal::Operator>,
     loading: bool,
     error_msg: Option<String>,
     
@@ -62,6 +64,7 @@ impl PaneState {
             selected_index: 0,
             connection_string: "".to_string(),
             sftp_session: None,
+            opendal_op: None,
             loading: false,
             error_msg: None,
             tx,
@@ -79,7 +82,6 @@ impl PaneState {
                 let path = self.current_path.to_string_lossy().into_owned();
                 let path = if path.is_empty() { ".".to_string() } else { path };
                 
-                // We must be careful because sftp_session is locked
                 let session = Arc::clone(session);
                 tokio::spawn(async move {
                     let sftp = session.lock().await;
@@ -93,16 +95,21 @@ impl PaneState {
             return;
         }
 
-        if self.vfs_type != VfsType::Local {
-            // Placeholder for remote VFS refresh
-            self.files.clear();
-            self.files.push(FileEntry {
-                name: "..".to_string(),
-                ext: "".to_string(),
-                is_dir: true,
-                size: 0,
-                modified: None,
-            });
+        if self.vfs_type == VfsType::Ftp || self.vfs_type == VfsType::WebDav {
+            if let Some(op) = &self.opendal_op {
+                self.loading = true;
+                let tx = self.tx.clone();
+                let path = self.current_path.to_string_lossy().into_owned();
+                let op = op.clone();
+                
+                tokio::spawn(async move {
+                    if let Ok(files) = crate::opendal_client::list_opendal_dir(&op, &path).await {
+                        let _ = tx.send(messages::PaneMessage::FilesFetched(files));
+                    } else {
+                        let _ = tx.send(messages::PaneMessage::SftpError("Failed to list remote dir".into()));
+                    }
+                });
+            }
             return;
         }
 
@@ -190,10 +197,14 @@ struct FaroCommander {
     ssh_host: String,
     ssh_output: String,
     ssh_input: String,
+    ssh_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    ssh_rx: crossbeam_channel::Receiver<messages::SshMessage>,
+    ssh_ui_tx: crossbeam_channel::Sender<messages::SshMessage>,
 }
 
 impl Default for FaroCommander {
     fn default() -> Self {
+        let (ssh_ui_tx, ssh_rx) = crossbeam_channel::unbounded();
         Self {
             left_pane: PaneState::new("C:\\"),
             right_pane: PaneState::new("C:\\"),
@@ -212,6 +223,9 @@ impl Default for FaroCommander {
             ssh_host: "".to_string(),
             ssh_output: "Welcome to FaroCommander SSH Terminal.\n".to_string(),
             ssh_input: "".to_string(),
+            ssh_tx: None,
+            ssh_rx,
+            ssh_ui_tx,
         }
     }
 }
@@ -356,20 +370,14 @@ impl eframe::App for FaroCommander {
         egui::TopBottomPanel::bottom("bottom_panel")
             .frame(bottom_frame)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let h = 28.0;
-                    let spacing = ui.spacing().item_spacing.x;
-                    let num_buttons = 7.0;
-                    let total_spacing = spacing * (num_buttons - 1.0);
-                    let button_width = (ui.available_width() - total_spacing) / num_buttons;
-                    
-                    if ui.add_sized([button_width, h], egui::Button::new("F3 View")).clicked() { trigger_f3 = true; }
-                    if ui.add_sized([button_width, h], egui::Button::new("F4 Edit")).clicked() { trigger_f4 = true; }
-                    if ui.add_sized([button_width, h], egui::Button::new("F5 Copy")).clicked() { trigger_f5 = true; }
-                    if ui.add_sized([button_width, h], egui::Button::new("F6 RenMov")).clicked() { trigger_f6 = true; }
-                    if ui.add_sized([button_width, h], egui::Button::new("F7 Mkdir")).clicked() { trigger_f7 = true; }
-                    if ui.add_sized([button_width, h], egui::Button::new("F8 Delete")).clicked() { trigger_f8 = true; }
-                    if ui.add_sized([button_width, h], egui::Button::new("Alt+F4 Exit")).clicked() { trigger_exit = true; }
+                ui.columns(7, |cols| {
+                    if cols[0].add_sized([cols[0].available_width(), 28.0], egui::Button::new("F3 View")).clicked() { trigger_f3 = true; }
+                    if cols[1].add_sized([cols[1].available_width(), 28.0], egui::Button::new("F4 Edit")).clicked() { trigger_f4 = true; }
+                    if cols[2].add_sized([cols[2].available_width(), 28.0], egui::Button::new("F5 Copy")).clicked() { trigger_f5 = true; }
+                    if cols[3].add_sized([cols[3].available_width(), 28.0], egui::Button::new("F6 RenMov")).clicked() { trigger_f6 = true; }
+                    if cols[4].add_sized([cols[4].available_width(), 28.0], egui::Button::new("F7 Mkdir")).clicked() { trigger_f7 = true; }
+                    if cols[5].add_sized([cols[5].available_width(), 28.0], egui::Button::new("F8 Delete")).clicked() { trigger_f8 = true; }
+                    if cols[6].add_sized([cols[6].available_width(), 28.0], egui::Button::new("Alt+F4 Exit")).clicked() { trigger_exit = true; }
                 });
             });
 
@@ -403,6 +411,22 @@ impl eframe::App for FaroCommander {
             });
         });
 
+        // Process SSH Messages
+        while let Ok(msg) = self.ssh_rx.try_recv() {
+            match msg {
+                messages::SshMessage::Output(text) => {
+                    self.ssh_output.push_str(&text);
+                }
+                messages::SshMessage::Error(err) => {
+                    self.ssh_output.push_str(&format!("\n[ERROR]: {}\n", err));
+                }
+                messages::SshMessage::Disconnected => {
+                    self.ssh_output.push_str("\n[Disconnected]\n");
+                    self.ssh_tx = None;
+                }
+            }
+        }
+
         if self.show_ssh_terminal {
             egui::Window::new("SSH Terminal")
                 .open(&mut self.show_ssh_terminal)
@@ -414,7 +438,28 @@ impl eframe::App for FaroCommander {
                         ui.add(egui::TextEdit::singleline(&mut self.ssh_host));
                         if ui.button("Connect").clicked() {
                             self.ssh_output.push_str("\nConnecting...\n");
-                            // TODO: Dispatch tokio task to connect SSH
+                            let conn = self.ssh_host.clone();
+                            let ui_tx = self.ssh_ui_tx.clone();
+                            let (tx, rx) = tokio::sync::mpsc::channel(32);
+                            self.ssh_tx = Some(tx);
+                            
+                            let mut conn = self.ssh_host.clone();
+                            if !conn.contains("://") {
+                                conn = format!("ssh://{}", conn);
+                            }
+                            
+                            tokio::spawn(async move {
+                                if let Ok(url) = url::Url::parse(&conn) {
+                                    let host = url.host_str().unwrap_or("localhost").to_string();
+                                    let port = url.port().unwrap_or(22);
+                                    let user = url.username().to_string();
+                                    let pass = url.password().unwrap_or("").to_string();
+                                    
+                                    crate::ssh_client::start_ssh_terminal(host, port, user, pass, ui_tx, rx).await;
+                                } else {
+                                    let _ = ui_tx.send(messages::SshMessage::Error("Invalid URI".to_string()));
+                                }
+                            });
                         }
                     });
                     ui.separator();
@@ -430,8 +475,10 @@ impl eframe::App for FaroCommander {
                         if res.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                             let cmd = self.ssh_input.clone();
                             self.ssh_input.clear();
-                            self.ssh_output.push_str(&format!("> {}\n", cmd));
-                            // // TODO: Send to SSH session
+                            // self.ssh_output.push_str(&format!("> {}\n", cmd)); // don't echo local cmd, let PTY echo it
+                            if let Some(tx) = &self.ssh_tx {
+                                let _ = tx.try_send(cmd);
+                            }
                             res.request_focus();
                         }
                     });
@@ -539,6 +586,11 @@ impl FaroCommander {
                     pane.loading = false;
                     pane.refresh();
                 }
+                messages::PaneMessage::OpendalConnected(op) => {
+                    pane.opendal_op = Some(op);
+                    pane.loading = false;
+                    pane.refresh();
+                }
                 messages::PaneMessage::SftpError(err) => {
                     pane.error_msg = Some(err);
                     pane.loading = false;
@@ -550,15 +602,10 @@ impl FaroCommander {
             }
         }
 
-        // Draw a frame around the pane to fill the area completely
+        // Removed the strokes/borders as per user request
         let frame = egui::Frame::none()
             .fill(ui.visuals().panel_fill)
-            .inner_margin(4.0)
-            .stroke(if is_active {
-                egui::Stroke::new(2.0, egui::Color32::LIGHT_BLUE)
-            } else {
-                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
-            });
+            .inner_margin(4.0);
 
         frame.show(ui, |ui| {
             ui.set_min_height(ui.available_height());
@@ -588,9 +635,12 @@ impl FaroCommander {
                                 let tx = pane.tx.clone();
                                 
                                 // parse user:pass@host:port
-                                let conn = pane.connection_string.clone();
+                                let mut conn = pane.connection_string.clone();
+                                if !conn.contains("://") {
+                                    conn = format!("sftp://{}", conn);
+                                }
                                 tokio::spawn(async move {
-                                    if let Ok(url) = url::Url::parse(&format!("sftp://{}", conn)) {
+                                    if let Ok(url) = url::Url::parse(&conn) {
                                         let host = url.host_str().unwrap_or("localhost");
                                         let port = url.port().unwrap_or(22);
                                         let user = url.username();
@@ -608,6 +658,23 @@ impl FaroCommander {
                                         let _ = tx.send(messages::PaneMessage::SftpError("Invalid URI format".to_string()));
                                     }
                                 });
+                            } else if pane.vfs_type == VfsType::Ftp || pane.vfs_type == VfsType::WebDav {
+                                pane.loading = true;
+                                pane.error_msg = None;
+                                let tx = pane.tx.clone();
+                                let conn = pane.connection_string.clone();
+                                let vfs_type = pane.vfs_type.clone();
+                                
+                                tokio::spawn(async move {
+                                    match crate::opendal_client::connect_opendal(&vfs_type, &conn) {
+                                        Ok(op) => {
+                                            let _ = tx.send(messages::PaneMessage::OpendalConnected(op));
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(messages::PaneMessage::SftpError(format!("Connect Error: {}", e)));
+                                        }
+                                    }
+                                });
                             }
                         }
                         
@@ -615,7 +682,7 @@ impl FaroCommander {
                             ui.spinner();
                         }
                         if let Some(err) = &pane.error_msg {
-                            ui.colored_label(egui::Color32::RED, err);
+                            ui.label(format!("Error: {}", err));
                         }
                     } else {
                         // Dynamic Windows Drives
@@ -639,6 +706,9 @@ impl FaroCommander {
                 }
                 ui.separator();
                 
+                // File List
+                let mut action_navigate = None;
+                
                 // Handle keyboard navigation
                 if is_active {
                     if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
@@ -654,29 +724,18 @@ impl FaroCommander {
                     if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                         if let Some(file) = pane.files.get(pane.selected_index) {
                             if file.is_dir {
-                                let nav_name = file.name.clone();
-                                if nav_name == ".." {
-                                    if let Some(parent) = pane.current_path.parent() {
-                                        pane.current_path = parent.to_path_buf();
-                                    }
-                                } else {
-                                    pane.current_path.push(nav_name);
-                                }
-                                pane.refresh();
-                                pane.selected_index = 0;
+                                action_navigate = Some(file.name.clone());
                             }
                         }
                     }
                 }
-
-                // File List
-                let mut action_navigate = None;
                 
                 egui_extras::TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
                     .vscroll(true)
                     .auto_shrink([false, false])
+                    .sense(egui::Sense::click())
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .column(egui_extras::Column::initial(150.0).at_least(100.0).clip(true).resizable(true)) // Name
                 .column(egui_extras::Column::initial(50.0).at_least(30.0).clip(true).resizable(true))  // Ext
@@ -702,45 +761,58 @@ impl FaroCommander {
                         };
 
                         body.row(20.0, |mut row| {
-                            // Make the row selectable/clickable
+                            // Make the row selectable/clickable via our own state
                             row.set_selected(is_selected);
                             
-                            row.col(|ui| {
-                                let label = ui.selectable_label(is_selected, &name_text);
-                                if label.clicked() {
-                                    self.active_pane_is_left = is_left;
-                                    pane.selected_index = idx;
-                                }
-                                if label.double_clicked() {
-                                    if file.is_dir {
-                                        action_navigate = Some(file.name.clone());
-                                    }
-                                }
-                            });
+                            row.col(|ui| { ui.label(&name_text); });
                             row.col(|ui| { ui.label(&ext_text); });
                             row.col(|ui| { ui.label(&size_text); });
                             row.col(|ui| { ui.label(&date_text); });
+                            
+                            let resp = row.response();
+                            if resp.clicked() {
+                                self.active_pane_is_left = is_left;
+                                pane.selected_index = idx;
+                                resp.surrender_focus();
+                            }
+                            if resp.double_clicked() {
+                                if file.is_dir {
+                                    action_navigate = Some(file.name.clone());
+                                }
+                            }
                         });
                     }
                 });
 
-            if let Some(nav_dir) = action_navigate {
-                if nav_dir == ".." {
-                    if let Some(parent) = pane.current_path.parent() {
-                        pane.current_path = parent.to_path_buf();
+                if let Some(nav_dir) = action_navigate {
+                    if nav_dir == ".." {
+                        if let Some(parent) = pane.current_path.parent() {
+                            let prev_dir_name = pane.current_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            pane.current_path = parent.to_path_buf();
+                            pane.refresh();
+                            
+                            // Try to find the directory we just left and select it
+                            if let Some(idx) = pane.files.iter().position(|f| f.name == prev_dir_name) {
+                                pane.selected_index = idx;
+                            } else {
+                                pane.selected_index = 0;
+                            }
+                        }
+                    } else {
+                        pane.current_path.push(nav_dir);
+                        pane.refresh();
+                        pane.selected_index = 0;
                     }
-                } else {
-                    pane.current_path.push(nav_dir);
                 }
-                pane.refresh();
-                pane.selected_index = 0;
-            }
             });
         });
     }
 }
 
 fn main() -> Result<(), eframe::Error> {
+    // Initialize rustls default provider
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Initialize tokio runtime for background network tasks
     let rt = tokio::runtime::Runtime::new().expect("Unable to create tokio runtime");
     let _guard = rt.enter();
@@ -761,3 +833,4 @@ fn main() -> Result<(), eframe::Error> {
         Box::new(|_cc| Box::<FaroCommander>::default()),
     )
 }
+mod opendal_client;
