@@ -1,5 +1,9 @@
 /target
+/installer
 settings.json
+bookmarks.json
 ssh_profiles.json
 rdp_profiles.json
+ssh_vault.json
+rdp_vault.json
 vault.enc
