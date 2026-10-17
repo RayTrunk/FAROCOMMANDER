@@ -1,1 +1,5 @@
 /target
+settings.json
+ssh_profiles.json
+rdp_profiles.json
+vault.enc

@@ -2,6 +2,7 @@
 name = "farocommander"
 version = "0.1.0"
 edition = "2021"
+default-run = "farocommander"
 
 [dependencies]
 eframe = "0.27.2"
@@ -20,3 +21,29 @@ russh-sftp = "3.0.1"
 url = "2.5.8"
 futures = "0.3.34"
 rustls = { version = "0.23.45", features = ["ring"] }
+egui_code_editor = "=0.2.7"
+zip = "9.0.1"
+image = "0.24.9"
+sevenz-rust = "0.6"
+tar = "0.4"
+flate2 = "1.1"
+bzip2 = "0.6"
+sha2 = "0.10"
+md5 = "0.8"
+crc32fast = "1.5"
+ring = "0.17"
+ironrdp = { version = "=0.13.0", features = ["connector", "session", "graphics", "input", "displaycontrol", "dvc"] }
+ironrdp-tokio = "=0.7.0"
+ironrdp-tls = { version = "=0.1.0", features = ["rustls"] }
+
+[profile.dev.package.ironrdp-graphics]
+opt-level = 3
+
+[profile.dev.package.ironrdp-session]
+opt-level = 3
+
+[profile.dev.package.ironrdp-pdu]
+opt-level = 3
+
+[profile.dev.package.ironrdp-core]
+opt-level = 3

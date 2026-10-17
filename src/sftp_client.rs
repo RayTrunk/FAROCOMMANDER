@@ -1,20 +1,16 @@
 use russh::client;
-use russh::client::AuthResult;
-use russh::keys::PublicKeyOrCertificate;
 use russh_sftp::client::SftpSession;
-use std::sync::Arc;
 use crate::FileEntry;
+use crate::ssh_client::{connect_and_authenticate, SshAuthMethod, SshHandler, SshProfile};
 
-pub struct ClientHandler {}
-
-impl client::Handler for ClientHandler {
-    type Error = russh::Error;
-    async fn check_server_key(
-        &mut self,
-        _server_public_key: &PublicKeyOrCertificate,
-    ) -> Result<bool, Self::Error> {
-        Ok(true) // Accept all keys for now
-    }
+pub async fn connect_sftp_profile(
+    profile: &SshProfile,
+) -> Result<(client::Handle<SshHandler>, SftpSession), String> {
+    let session = connect_and_authenticate(profile).await?;
+    let channel = session.channel_open_session().await.map_err(|e| e.to_string())?;
+    channel.request_subsystem(true, "sftp").await.map_err(|e| e.to_string())?;
+    let sftp = SftpSession::new(channel.into_stream()).await.map_err(|e| e.to_string())?;
+    Ok((session, sftp))
 }
 
 pub async fn connect_sftp(
@@ -22,26 +18,18 @@ pub async fn connect_sftp(
     port: u16,
     user: &str,
     pass: &str,
-) -> Result<(client::Handle<ClientHandler>, SftpSession), String> {
-    let config = client::Config {
-        ..<_>::default()
+) -> Result<(client::Handle<SshHandler>, SftpSession), String> {
+    let profile = SshProfile {
+        name: String::new(),
+        host: host.to_string(),
+        port,
+        user: user.to_string(),
+        auth_method: SshAuthMethod::Password,
+        password: pass.to_string(),
+        key_path: String::new(),
+        key_passphrase: String::new(),
     };
-    let config = Arc::new(config);
-    let sh = ClientHandler {};
-    
-    let mut session = client::connect(config, (host, port), sh).await.map_err(|e| e.to_string())?;
-    
-    let auth_res = session.authenticate_password(user, pass).await.map_err(|e| e.to_string())?;
-    if !matches!(auth_res, AuthResult::Success) {
-        return Err("Authentication failed".into());
-    }
-
-    let channel = session.channel_open_session().await.map_err(|e| e.to_string())?;
-    channel.request_subsystem(true, "sftp").await.map_err(|e| e.to_string())?;
-    
-    let sftp = SftpSession::new(channel.into_stream()).await.map_err(|e| e.to_string())?;
-    
-    Ok((session, sftp))
+    connect_sftp_profile(&profile).await
 }
 
 pub async fn list_sftp_dir(sftp: &SftpSession, path: &str) -> Result<Vec<FileEntry>, String> {
