@@ -361,7 +361,7 @@ pub fn read_archive_entry(archive_path: &str, entry_path: &str) -> Result<Vec<u8
 pub fn extract_archive(
     archive_path: &str,
     dest_dir: &str,
-    tx: crossbeam_channel::Sender<(String, f32)>,
+    tx: std::sync::mpsc::Sender<(String, f32)>,
 ) -> Result<(), String> {
     let res = extract_archive_inner(archive_path, dest_dir, &tx);
     let _ = tx.send(("Fertig".to_string(), 1.0));
@@ -371,7 +371,7 @@ pub fn extract_archive(
 fn extract_archive_inner(
     archive_path: &str,
     dest_dir: &str,
-    tx: &crossbeam_channel::Sender<(String, f32)>,
+    tx: &std::sync::mpsc::Sender<(String, f32)>,
 ) -> Result<(), String> {
     let lower = archive_path.to_lowercase();
     let archive_name = Path::new(archive_path)
@@ -476,7 +476,7 @@ fn extract_archive_inner(
 fn append_items_to_tar<W: std::io::Write>(
     tar: &mut tar::Builder<W>,
     all_items: &[(std::path::PathBuf, String, bool)],
-    tx: &crossbeam_channel::Sender<(String, f32)>,
+    tx: &std::sync::mpsc::Sender<(String, f32)>,
     fmt_name: &str,
 ) -> Result<(), String> {
     let total = all_items.len().max(1);
@@ -502,7 +502,7 @@ pub fn pack_archive(
     sources: Vec<(String, String, bool)>,
     target_archive: &str,
     format: ArchiveFormat,
-    tx: crossbeam_channel::Sender<(String, f32)>,
+    tx: std::sync::mpsc::Sender<(String, f32)>,
 ) -> Result<(), String> {
     let res = pack_archive_inner(sources, target_archive, format, &tx);
     let _ = tx.send(("Archiv erstellt".to_string(), 1.0));
@@ -513,7 +513,7 @@ fn pack_archive_inner(
     sources: Vec<(String, String, bool)>,
     target_archive: &str,
     format: ArchiveFormat,
-    tx: &crossbeam_channel::Sender<(String, f32)>,
+    tx: &std::sync::mpsc::Sender<(String, f32)>,
 ) -> Result<(), String> {
     if let Some(parent) = Path::new(target_archive).parent() {
         if !parent.as_os_str().is_empty() {

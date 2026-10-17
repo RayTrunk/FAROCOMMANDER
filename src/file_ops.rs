@@ -76,7 +76,7 @@ pub async fn delete_path(handle: &VfsHandle, path: &str, is_dir: bool) -> Result
         }
         VfsHandle::Opendal(op) => {
             if is_dir {
-                op.remove_all(path).await.map_err(|e| e.to_string())
+                op.delete_with(path).recursive(true).await.map_err(|e| e.to_string())
             } else {
                 op.delete(path).await.map_err(|e| e.to_string())
             }
@@ -85,15 +85,6 @@ pub async fn delete_path(handle: &VfsHandle, path: &str, is_dir: bool) -> Result
             Err("Zip modifying is not supported yet".to_string())
         }
     }
-}
-
-pub async fn delete_file(handle: &VfsHandle, path: &str) -> Result<(), String> {
-    let is_dir = if let VfsHandle::Local = handle {
-        std::path::Path::new(path).is_dir()
-    } else {
-        false
-    };
-    delete_path(handle, path, is_dir).await
 }
 
 pub async fn create_dir(handle: &VfsHandle, path: &str) -> Result<(), String> {
@@ -119,35 +110,15 @@ pub async fn copy_single_file_chunked(
     src_path: &str,
     dst_handle: &VfsHandle,
     dst_path: &str,
-    tx: &crossbeam_channel::Sender<(String, f32)>,
+    tx: &std::sync::mpsc::Sender<(String, f32)>,
     label: &str,
 ) -> Result<(), String> {
-    // True 64KB chunk streaming when both or either side is Local/SFTP
     if let (VfsHandle::Local, VfsHandle::Local) = (src_handle, dst_handle) {
         if let Some(parent) = std::path::Path::new(dst_path).parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
-        let mut reader = tokio::fs::File::open(src_path).await.map_err(|e| e.to_string())?;
-        let total_size = reader.metadata().await.map(|m| m.len()).unwrap_or(0);
-        let mut writer = tokio::fs::File::create(dst_path).await.map_err(|e| e.to_string())?;
-        
-        let mut buf = vec![0u8; 65536]; // 64 KB chunks
-        let mut copied: u64 = 0;
-        let _ = tx.send((label.to_string(), 0.0));
-        
-        loop {
-            let n = reader.read(&mut buf).await.map_err(|e| e.to_string())?;
-            if n == 0 {
-                break;
-            }
-            writer.write_all(&buf[..n]).await.map_err(|e| e.to_string())?;
-            copied += n as u64;
-            if total_size > 0 {
-                let frac = (copied as f32 / total_size as f32).min(0.99);
-                let _ = tx.send((label.to_string(), frac));
-            }
-        }
-        writer.flush().await.map_err(|e| e.to_string())?;
+        let _ = tx.send((label.to_string(), 0.2));
+        tokio::fs::copy(src_path, dst_path).await.map_err(|e| e.to_string())?;
         return Ok(());
     }
 
@@ -164,7 +135,7 @@ pub async fn copy_file_with_progress(
     src_path: &str,
     dst_handle: &VfsHandle,
     dst_path: &str,
-    tx: crossbeam_channel::Sender<(String, f32)>,
+    tx: std::sync::mpsc::Sender<(String, f32)>,
     file_name: String,
 ) -> Result<(), String> {
     // Check if source is a local directory -> recursive copy!
@@ -209,7 +180,7 @@ pub async fn move_file(
     src_path: &str,
     dst_handle: &VfsHandle,
     dst_path: &str,
-    tx: crossbeam_channel::Sender<(String, f32)>,
+    tx: std::sync::mpsc::Sender<(String, f32)>,
     file_name: String,
 ) -> Result<(), String> {
     let _ = tx.send((format!("Moving {}", file_name), 0.0));

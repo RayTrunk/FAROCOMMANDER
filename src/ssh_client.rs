@@ -1,4 +1,4 @@
-use crossbeam_channel::Sender;
+use std::sync::mpsc::Sender;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::pbkdf2::{derive, PBKDF2_HMAC_SHA256};
 use ring::rand::{SecureRandom, SystemRandom};

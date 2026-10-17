@@ -1,4 +1,4 @@
-use crossbeam_channel::Sender;
+use std::sync::mpsc::Sender;
 use eframe::egui;
 use ironrdp::connector::connection_activation::ConnectionActivationState;
 use ironrdp::connector::{BitmapConfig, ClientConnector, Config, Credentials, DesktopSize, ServerName};
@@ -29,10 +29,6 @@ pub struct RdpProfile {
     pub domain: String,
     pub user: String,
     pub password: String,
-    #[serde(default)]
-    pub width: u16,
-    #[serde(default)]
-    pub height: u16,
     #[serde(default = "default_true")]
     pub enable_credssp: bool,
     #[serde(default = "default_true")]
@@ -48,8 +44,6 @@ impl Default for RdpProfile {
             domain: String::new(),
             user: "Administrator".to_string(),
             password: String::new(),
-            width: 0,
-            height: 0,
             enable_credssp: true,
             fast_mode: true,
         }

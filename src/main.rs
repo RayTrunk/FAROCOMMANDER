@@ -2,16 +2,51 @@ use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::fs;
 use chrono::{DateTime, Local};
-use humansize::{format_size, BINARY};
 use std::sync::Arc;
 
 mod sftp_client;
 mod ssh_client;
 mod rdp_client;
-mod messages;
+mod net_scanner;
 mod file_ops;
 mod archive_ops;
 mod tools;
+
+pub mod messages {
+    pub enum PaneMessage {
+        SftpConnected(russh_sftp::client::SftpSession),
+        OpendalConnected(opendal::Operator),
+        SftpError(String),
+        FilesFetched(Vec<crate::FileEntry>),
+        DirSizeCalculated(String, u64),
+        Refresh,
+    }
+    pub enum SshMessage {
+        Output(String),
+        Error(String),
+        Disconnected,
+    }
+    pub enum EditorMessage {
+        FileLoaded(String, String, String),
+        ImageLoaded(String, [usize; 2], Vec<u8>),
+        Error(String),
+    }
+}
+
+pub fn format_size_binary(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut val = bytes as f64;
+    let mut idx = 0;
+    while val >= 1024.0 && idx + 1 < UNITS.len() {
+        val /= 1024.0;
+        idx += 1;
+    }
+    if idx == 0 {
+        format!("{} B", bytes)
+    } else {
+        format!("{:.2} {}", val, UNITS[idx])
+    }
+}
 
 struct ReadOnlyTextBuffer<'a>(&'a str);
 impl<'a> eframe::egui::TextBuffer for ReadOnlyTextBuffer<'a> {
@@ -42,15 +77,48 @@ impl VfsType {
     }
 }
 
-struct FileEntry {
-    name: String,
-    ext: String,
-    is_dir: bool,
-    size: u64,
-    modified: Option<DateTime<Local>>,
+pub struct FileEntry {
+    pub name: String,
+    pub ext: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: Option<DateTime<Local>>,
 }
 
 impl FileEntry {
+    pub fn parent_dir() -> Self {
+        Self {
+            name: "..".to_string(),
+            ext: String::new(),
+            is_dir: true,
+            size: 0,
+            modified: None,
+        }
+    }
+
+    pub fn from_filename(
+        filename: String,
+        is_dir: bool,
+        size: u64,
+        modified: Option<DateTime<Local>>,
+    ) -> Self {
+        let (name, ext) = if is_dir {
+            (filename, String::new())
+        } else {
+            let p = Path::new(&filename);
+            let n = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let e = p.extension().unwrap_or_default().to_string_lossy().to_string();
+            (n, e)
+        };
+        Self {
+            name,
+            ext,
+            is_dir,
+            size,
+            modified,
+        }
+    }
+
     pub fn full_name(&self) -> String {
         if self.is_dir || self.ext.is_empty() {
             self.name.clone()
@@ -94,13 +162,13 @@ struct PaneState {
     error_msg: Option<String>,
     
     // Communication
-    tx: crossbeam_channel::Sender<messages::PaneMessage>,
-    rx: crossbeam_channel::Receiver<messages::PaneMessage>,
+    tx: std::sync::mpsc::Sender<messages::PaneMessage>,
+    rx: std::sync::mpsc::Receiver<messages::PaneMessage>,
 }
 
 impl PaneState {
     fn new(path: impl AsRef<Path>) -> Self {
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut state = Self {
             vfs_type: VfsType::Local,
             current_path: path.as_ref().to_path_buf(),
@@ -216,59 +284,18 @@ impl PaneState {
         }
 
         self.files.clear();
-        
         if self.current_path.parent().is_some() {
-            self.files.push(FileEntry {
-                name: "..".to_string(),
-                ext: "".to_string(),
-                is_dir: true,
-                size: 0,
-                modified: None,
-            });
+            self.files.push(FileEntry::parent_dir());
         }
-
         if let Ok(entries) = fs::read_dir(&self.current_path) {
-            let mut dirs = Vec::new();
-            let mut files = Vec::new();
-
             for entry in entries.flatten() {
                 let metadata = entry.metadata().ok();
                 let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
                 let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-                let modified = metadata.and_then(|m| m.modified().ok())
-                    .map(|sys_time| DateTime::from(sys_time));
-
-                let path = entry.path();
-                let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                let ext = if is_dir {
-                    "".to_string()
-                } else {
-                    path.extension().unwrap_or_default().to_string_lossy().to_string()
-                };
-                
-                let full_name = if is_dir {
-                    entry.file_name().to_string_lossy().to_string()
-                } else {
-                    name.clone()
-                };
-
-                let file_entry = FileEntry {
-                    name: full_name,
-                    ext,
-                    is_dir,
-                    size,
-                    modified,
-                };
-
-                if is_dir {
-                    dirs.push(file_entry);
-                } else {
-                    files.push(file_entry);
-                }
+                let modified = metadata.and_then(|m| m.modified().ok()).map(DateTime::from);
+                let filename = entry.file_name().to_string_lossy().to_string();
+                self.files.push(FileEntry::from_filename(filename, is_dir, size, modified));
             }
-
-            self.files.extend(dirs);
-            self.files.extend(files);
             self.sort_files();
         }
     }
@@ -327,15 +354,11 @@ struct FaroCommander {
     left_pane: PaneState,
     right_pane: PaneState,
     active_pane_is_left: bool,
-    show_copy_dialog: bool,
-    copy_target_path: String,
-    copy_source_path: String,
-    copy_sources: Vec<(String, String, bool)>, // (src_full_path, file_name, is_dir)
-    
-    show_move_dialog: bool,
-    move_target_path: String,
-    move_source_path: String,
-    move_sources: Vec<(String, String, bool)>,
+    show_transfer_dialog: bool,
+    transfer_is_move: bool,
+    transfer_target_path: String,
+    transfer_source_path: String,
+    transfer_sources: Vec<(String, String, bool)>, // (src_full_path, file_name, is_dir)
     
     show_mkdir_dialog: bool,
     mkdir_path: String,
@@ -369,8 +392,8 @@ struct FaroCommander {
     ssh_cmd_history: Vec<String>,
     ssh_history_idx: Option<usize>,
     ssh_tx: Option<tokio::sync::mpsc::Sender<String>>,
-    ssh_rx: crossbeam_channel::Receiver<messages::SshMessage>,
-    ssh_ui_tx: crossbeam_channel::Sender<messages::SshMessage>,
+    ssh_rx: std::sync::mpsc::Receiver<messages::SshMessage>,
+    ssh_ui_tx: std::sync::mpsc::Sender<messages::SshMessage>,
 
     // IronRDP Remote Desktop & Vault Profiles
     show_rdp_window: bool,
@@ -384,8 +407,8 @@ struct FaroCommander {
     rdp_texture: Option<egui::TextureHandle>,
     rdp_remote_size: (u16, u16),
     rdp_tx: Option<tokio::sync::mpsc::Sender<crate::rdp_client::RdpInputMessage>>,
-    rdp_rx: crossbeam_channel::Receiver<crate::rdp_client::RdpUiMessage>,
-    rdp_ui_tx: crossbeam_channel::Sender<crate::rdp_client::RdpUiMessage>,
+    rdp_rx: std::sync::mpsc::Receiver<crate::rdp_client::RdpUiMessage>,
+    rdp_ui_tx: std::sync::mpsc::Sender<crate::rdp_client::RdpUiMessage>,
 
     // Viewer / Editor
     show_editor: bool,
@@ -393,8 +416,8 @@ struct FaroCommander {
     editor_content: String,
     editor_is_view_only: bool,
     editor_vfs_handle: Option<crate::file_ops::VfsHandle>,
-    editor_rx: crossbeam_channel::Receiver<messages::EditorMessage>,
-    editor_tx: crossbeam_channel::Sender<messages::EditorMessage>,
+    editor_rx: std::sync::mpsc::Receiver<messages::EditorMessage>,
+    editor_tx: std::sync::mpsc::Sender<messages::EditorMessage>,
     editor_search_query: String,
     editor_replace_query: String,
     editor_show_find_bar: bool,
@@ -414,8 +437,8 @@ struct FaroCommander {
     editor_image_zoom: f32,
 
     // Background task progress
-    task_tx: crossbeam_channel::Sender<(String, f32)>,
-    task_rx: crossbeam_channel::Receiver<(String, f32)>,
+    task_tx: std::sync::mpsc::Sender<(String, f32)>,
+    task_rx: std::sync::mpsc::Receiver<(String, f32)>,
     active_task: Option<(String, f32)>,
     
     // Search
@@ -424,8 +447,8 @@ struct FaroCommander {
     search_results: Vec<String>,
     search_selected: Option<usize>,
     search_running: bool,
-    search_tx: crossbeam_channel::Sender<String>,
-    search_rx: crossbeam_channel::Receiver<String>,
+    search_tx: std::sync::mpsc::Sender<String>,
+    search_rx: std::sync::mpsc::Receiver<String>,
 
     // Pack / Unpack Archives (Alt+F5 / Alt+F9)
     show_pack_dialog: bool,
@@ -449,8 +472,8 @@ struct FaroCommander {
     // Feature 5: File Properties & Checksums (Alt+Enter)
     show_properties_dialog: bool,
     properties_state: crate::tools::FilePropertiesState,
-    props_tx: crossbeam_channel::Sender<(u64, usize, usize, String, String, String)>,
-    props_rx: crossbeam_channel::Receiver<(u64, usize, usize, String, String, String)>,
+    props_tx: std::sync::mpsc::Sender<(u64, usize, usize, String, String, String)>,
+    props_rx: std::sync::mpsc::Receiver<(u64, usize, usize, String, String, String)>,
 
     // Feature 6: Command Line & Output
     cmdline_input: String,
@@ -466,28 +489,34 @@ struct FaroCommander {
     show_splash: bool,
     splash_start: Option<std::time::Instant>,
     splash_texture: Option<egui::TextureHandle>,
+
+    // Network Scanner & Password Generator (Tools menu)
+    show_net_scanner: bool,
+    net_scanner: crate::net_scanner::NetScannerState,
+    net_scan_tx: std::sync::mpsc::Sender<crate::net_scanner::NetScanUiMessage>,
+    net_scan_rx: std::sync::mpsc::Receiver<crate::net_scanner::NetScanUiMessage>,
+    show_password_generator: bool,
+    password_generator: crate::tools::PasswordGeneratorState,
 }
 
 impl Default for FaroCommander {
     fn default() -> Self {
-        let (ssh_ui_tx, ssh_rx) = crossbeam_channel::unbounded();
-        let (rdp_ui_tx, rdp_rx) = crossbeam_channel::unbounded();
-        let (e_tx, e_rx) = crossbeam_channel::unbounded();
-        let (task_tx, task_rx) = crossbeam_channel::unbounded();
-        let (search_tx, search_rx) = crossbeam_channel::unbounded();
-        let (props_tx, props_rx) = crossbeam_channel::unbounded();
+        let (ssh_ui_tx, ssh_rx) = std::sync::mpsc::channel();
+        let (rdp_ui_tx, rdp_rx) = std::sync::mpsc::channel();
+        let (e_tx, e_rx) = std::sync::mpsc::channel();
+        let (task_tx, task_rx) = std::sync::mpsc::channel();
+        let (search_tx, search_rx) = std::sync::mpsc::channel();
+        let (props_tx, props_rx) = std::sync::mpsc::channel();
+        let (net_scan_tx, net_scan_rx) = std::sync::mpsc::channel();
         Self {
             left_pane: PaneState::new("C:\\"),
             right_pane: PaneState::new("C:\\"),
             active_pane_is_left: true,
-            show_copy_dialog: false,
-            copy_target_path: String::new(),
-            copy_source_path: String::new(),
-            copy_sources: Vec::new(),
-            show_move_dialog: false,
-            move_target_path: String::new(),
-            move_source_path: String::new(),
-            move_sources: Vec::new(),
+            show_transfer_dialog: false,
+            transfer_is_move: false,
+            transfer_target_path: String::new(),
+            transfer_source_path: String::new(),
+            transfer_sources: Vec::new(),
             show_mkdir_dialog: false,
             mkdir_path: String::new(),
             show_delete_dialog: false,
@@ -588,6 +617,12 @@ impl Default for FaroCommander {
             show_splash: true,
             splash_start: None,
             splash_texture: None,
+            show_net_scanner: false,
+            net_scanner: crate::net_scanner::NetScannerState::default(),
+            net_scan_tx,
+            net_scan_rx,
+            show_password_generator: false,
+            password_generator: crate::tools::PasswordGeneratorState::default(),
         }
     }
 }
@@ -632,6 +667,12 @@ impl eframe::App for FaroCommander {
                                         .fill(egui::Color32::from_rgb(104, 232, 219)),
                                 );
                             });
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(140, 175, 210)),
+                            );
                         });
                     });
                 return;
@@ -678,8 +719,7 @@ impl eframe::App for FaroCommander {
                 });
         }
 
-        let dialog_open = self.show_copy_dialog
-            || self.show_move_dialog
+        let dialog_open = self.show_transfer_dialog
             || self.show_mkdir_dialog
             || self.show_delete_dialog
             || self.show_search_dialog
@@ -930,7 +970,7 @@ impl eframe::App for FaroCommander {
                         ui.strong("Größe:");
                         ui.label(format!(
                             "{} ({} Bytes)",
-                            format_size(self.properties_state.size, BINARY),
+                            format_size_binary(self.properties_state.size),
                             self.properties_state.size
                         ));
                         ui.end_row();
@@ -1090,22 +1130,22 @@ impl eframe::App for FaroCommander {
                         .show(ui, |ui| {
                             ui.vertical_centered(|ui| {
                                 ui.label(
-                                    egui::RichText::new("FARO COMMANDER (C) 2026 R.Trunk")
+                                    egui::RichText::new(concat!("FARO COMMANDER v", env!("CARGO_PKG_VERSION"), " (C) 2026 R.Trunk"))
                                         .strong()
                                         .size(15.0)
                                         .color(egui::Color32::from_rgb(104, 210, 255)),
                                 );
                                 ui.small(if is_de {
-                                    "Dual-Pane Dateimanager • Alle Rechte vorbehalten"
+                                    "Dual-Pane Dateimanager & Netzwerk-Suite • Lizenz: MIT"
                                 } else {
-                                    "Dual-Pane File Manager • All rights reserved"
+                                    "Dual-Pane File Manager & Network Suite • License: MIT"
                                 });
                             });
                         });
 
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.button(if is_de { "ℹ Programm-Info öffnen" } else { "ℹ Open About Dialog" }).clicked() {
+                        if ui.button(if is_de { "ℹ Programm-Info & Bibliotheken öffnen" } else { "ℹ Open About & Libraries" }).clicked() {
                             self.show_about_dialog = true;
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1122,34 +1162,104 @@ impl eframe::App for FaroCommander {
         // Info / About Dialog
         if self.show_about_dialog {
             egui::Window::new(if is_de { "ℹ Info — FARO COMMANDER" } else { "ℹ About — FARO COMMANDER" })
+                .id(egui::Id::new("faro_about_dialog_v3"))
                 .collapsible(false)
                 .resizable(false)
-                .default_width(380.0)
+                .default_width(640.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         if let Some(tex) = &self.splash_texture {
-                            ui.add(egui::Image::from_texture((tex.id(), egui::vec2(140.0, 140.0))));
+                            ui.add(egui::Image::from_texture((tex.id(), egui::vec2(96.0, 96.0))));
                         }
-                        ui.add_space(8.0);
-                        ui.heading("FARO COMMANDER");
                         ui.add_space(4.0);
+                        ui.heading(concat!("FARO COMMANDER v", env!("CARGO_PKG_VERSION")));
+                        ui.add_space(2.0);
                         ui.label(
-                            egui::RichText::new("FARO COMMANDER (C) 2026 R.Trunk")
+                            egui::RichText::new("FARO COMMANDER (C) 2026 R.Trunk • MIT License")
                                 .strong()
-                                .size(15.0)
+                                .size(14.0)
                                 .color(egui::Color32::GOLD),
                         );
-                        ui.add_space(6.0);
+                        ui.add_space(4.0);
                         ui.label(if is_de {
-                            "Moderner Zwei-Fenster-Dateimanager für Windows\nLocal • FTP • SFTP • WebDAV • ZIP/7Z/TAR/GZ/BZ2/RAR"
+                            "Moderner Zwei-Fenster-Dateimanager & Netzwerk-Suite für Windows\nLocal • FTP • SFTP • WebDAV • RDP • SSH • NetScanner • PassGen • Archive"
                         } else {
-                            "Modern Dual-Pane File Manager for Windows\nLocal • FTP • SFTP • WebDAV • ZIP/7Z/TAR/GZ/BZ2/RAR"
+                            "Modern Dual-Pane File Manager & Network Suite for Windows\nLocal • FTP • SFTP • WebDAV • RDP • SSH • NetScanner • PassGen • Archives"
                         });
-                        ui.add_space(10.0);
-                        if ui.button("OK").clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    });
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(if is_de {
+                            "📚 Verwendete Open-Source-Bibliotheken (Crates)"
+                        } else {
+                            "📚 Used Open-Source Libraries (Crates)"
+                        })
+                        .strong()
+                        .color(egui::Color32::from_rgb(104, 210, 255)),
+                    );
+                    ui.add_space(4.0);
+
+                    let libs: &[(&str, &str, &str, &str)] = &[
+                        ("egui / eframe / egui_extras", "0.27.2", "MIT OR Apache-2.0", if is_de { "GUI-Framework & Rendering" } else { "GUI Framework & Rendering" }),
+                        ("egui_code_editor", "0.2.7", "MIT", if is_de { "Integrierter Code-Editor & Syntax-Highlighting" } else { "Built-in Code Editor & Syntax Highlighting" }),
+                        ("tokio / futures", "1.53.2 / 0.3", "MIT", if is_de { "Asynchrone Runtime & Netzwerk-Tasks" } else { "Async Runtime & Network Tasks" }),
+                        ("opendal", "0.59.4", "Apache-2.0", if is_de { "Abstraktionsschicht für FTP & WebDAV" } else { "Data Access Layer (FTP, WebDAV)" }),
+                        ("russh / russh-sftp", "0.64.1 / 3.0.1", "Apache-2.0", if is_de { "SSH2-Client, Terminal & SFTP-Dateitransfer" } else { "SSH2 Client, Terminal & SFTP File Transfer" }),
+                        ("ironrdp / ironrdp-tokio / ironrdp-tls", "0.13.0", "MIT OR Apache-2.0", if is_de { "Nativer Remote Desktop Protocol (RDP) Client" } else { "Native Remote Desktop Protocol (RDP) Client" }),
+                        ("netscli-core", "0.3.4", "MIT", if is_de { "Netzwerk-Scanner (Subnetz, Port-Scan, OS-Fingerprinting, DNS/mDNS, Ping/Trace)" } else { "Network Scanner (Subnet, Ports, OS Hint, DNS/mDNS, Ping/Trace)" }),
+                        ("zxcvbn", "3.1.1", "MIT", if is_de { "Passwort-Stärke- & Wörterbuch-Musteranalyse" } else { "Password Strength & Dictionary Pattern Estimator" }),
+                        ("rustls / ring", "0.23.45 / 0.17", "MIT / Apache-2.0 / ISC", if is_de { "TLS-Verschlüsselung & Kryptographischer CSPRNG" } else { "TLS Cryptography & System CSPRNG" }),
+                        ("zip / sevenz-rust / tar / flate2 / bzip2", "9.0 / 0.6 / 0.4 / 1.1 / 0.6", "MIT / Apache-2.0", if is_de { "Archiv-Verarbeitung (ZIP, 7z, TAR, GZ, BZ2)" } else { "Archive Support (ZIP, 7z, TAR, GZ, BZ2)" }),
+                        ("sha2 / md5 / crc32fast", "0.10 / 0.8 / 1.5", "MIT OR Apache-2.0", if is_de { "Prüfsummen-Berechnung (SHA-256, MD5, CRC32)" } else { "Checksum Hashing (SHA-256, MD5, CRC32)" }),
+                        ("serde / serde_json", "1.0", "MIT OR Apache-2.0", if is_de { "Konfigurations- & Profil-Serialisierung" } else { "Configuration & Profile Serialization" }),
+                        ("chrono / walkdir / url / image", "0.4 / 2.5 / 2.5 / 0.24", "MIT / Apache-2.0 / Unlicense", if is_de { "Zeitstempel, Dateibaum-Suche, Bildvorschau & Hilfsfunktionen" } else { "Timestamps, Directory Traversal, Image Preview & Utilities" }),
+                    ];
+
+                    egui::ScrollArea::vertical()
+                        .id_source("about_libs_scroll")
+                        .max_height(210.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            egui::Grid::new("about_libs_grid")
+                                .striped(true)
+                                .num_columns(4)
+                                .spacing([10.0, 5.0])
+                                .show(ui, |ui| {
+                                    ui.strong(if is_de { "Bibliothek" } else { "Library" });
+                                    ui.strong("Version");
+                                    ui.strong(if is_de { "Lizenz" } else { "License" });
+                                    ui.strong(if is_de { "Verwendung" } else { "Purpose" });
+                                    ui.end_row();
+
+                                    for (name, ver, lic, desc) in libs {
+                                        ui.monospace(*name);
+                                        ui.small(*ver);
+                                        ui.colored_label(egui::Color32::from_rgb(130, 220, 160), *lic);
+                                        ui.small(*desc);
+                                        ui.end_row();
+                                    }
+                                });
+
+                            ui.add_space(6.0);
+                            ui.collapsing(if is_de { "📜 MIT-Lizenztext anzeigen" } else { "📜 Show MIT License Text" }, |ui| {
+                                ui.small(include_str!("../LICENSE"));
+                            });
+                        });
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.vertical_centered(|ui| {
+                        let ok_btn = egui::Button::new(egui::RichText::new("OK (Esc)").strong())
+                            .min_size(egui::vec2(140.0, 30.0));
+                        if ui.add(ok_btn).clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                             self.show_about_dialog = false;
                         }
                     });
+                    ui.add_space(4.0);
                 });
         }
 
@@ -1278,27 +1388,28 @@ impl eframe::App for FaroCommander {
                 });
         }
 
-        if self.show_copy_dialog {
-            egui::Window::new("Copy (F5)")
+        if self.show_transfer_dialog {
+            let is_move = self.transfer_is_move;
+            let title = if is_move { "Move/Rename (F6)" } else { "Copy (F5)" };
+            let verb = if is_move { "Move" } else { "Copy" };
+            egui::Window::new(title)
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.label(format!("Copy {} to:", self.copy_source_path));
-                    let response = ui.add(egui::TextEdit::singleline(&mut self.copy_target_path).desired_width(400.0));
+                    ui.label(format!("{} {} to:", verb, self.transfer_source_path));
+                    let response = ui.add(egui::TextEdit::singleline(&mut self.transfer_target_path).desired_width(400.0));
                     response.request_focus();
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() || ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            let sources = self.copy_sources.clone();
-                            let dst_input = self.copy_target_path.clone();
-                            
+                            let sources = self.transfer_sources.clone();
+                            let dst_input = self.transfer_target_path.clone();
                             let src_handle = if self.active_pane_is_left { self.left_pane.get_vfs_handle() } else { self.right_pane.get_vfs_handle() };
                             let dst_handle = if self.active_pane_is_left { self.right_pane.get_vfs_handle() } else { self.left_pane.get_vfs_handle() };
-                            
                             let tx_left = self.left_pane.tx.clone();
                             let tx_right = self.right_pane.tx.clone();
                             let ctx_clone = ctx.clone();
                             let task_tx = self.task_tx.clone();
-                            
+
                             tokio::spawn(async move {
                                 let is_batch = sources.len() > 1;
                                 for (src_path, file_name, _is_dir) in sources {
@@ -1307,62 +1418,21 @@ impl eframe::App for FaroCommander {
                                     } else {
                                         dst_input.clone()
                                     };
-                                    let _ = crate::file_ops::copy_file_with_progress(&src_handle, &src_path, &dst_handle, &dst_path, task_tx.clone(), file_name).await;
-                                }
-                                let _ = tx_left.send(messages::PaneMessage::Refresh);
-                                let _ = tx_right.send(messages::PaneMessage::Refresh);
-                                ctx_clone.request_repaint();
-                            });
-                            
-                            self.show_copy_dialog = false;
-                        }
-                        if ui.button("Cancel").clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                            self.show_copy_dialog = false;
-                        }
-                    });
-                });
-        }
-        
-        if self.show_move_dialog {
-            egui::Window::new("Move/Rename (F6)")
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.label(format!("Move {} to:", self.move_source_path));
-                    let response = ui.add(egui::TextEdit::singleline(&mut self.move_target_path).desired_width(400.0));
-                    response.request_focus();
-                    ui.horizontal(|ui| {
-                        if ui.button("OK").clicked() || ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            let sources = self.move_sources.clone();
-                            let dst_input = self.move_target_path.clone();
-                            
-                            let src_handle = if self.active_pane_is_left { self.left_pane.get_vfs_handle() } else { self.right_pane.get_vfs_handle() };
-                            let dst_handle = if self.active_pane_is_left { self.right_pane.get_vfs_handle() } else { self.left_pane.get_vfs_handle() };
-                            
-                            let tx_left = self.left_pane.tx.clone();
-                            let tx_right = self.right_pane.tx.clone();
-                            let ctx_clone = ctx.clone();
-                            let task_tx = self.task_tx.clone();
-                            
-                            tokio::spawn(async move {
-                                let is_batch = sources.len() > 1;
-                                for (src_path, file_name, _is_dir) in sources {
-                                    let dst_path = if is_batch {
-                                        std::path::Path::new(&dst_input).join(&file_name).to_string_lossy().into_owned()
+                                    if is_move {
+                                        let _ = crate::file_ops::move_file(&src_handle, &src_path, &dst_handle, &dst_path, task_tx.clone(), file_name).await;
                                     } else {
-                                        dst_input.clone()
-                                    };
-                                    let _ = crate::file_ops::move_file(&src_handle, &src_path, &dst_handle, &dst_path, task_tx.clone(), file_name).await;
+                                        let _ = crate::file_ops::copy_file_with_progress(&src_handle, &src_path, &dst_handle, &dst_path, task_tx.clone(), file_name).await;
+                                    }
                                 }
                                 let _ = tx_left.send(messages::PaneMessage::Refresh);
                                 let _ = tx_right.send(messages::PaneMessage::Refresh);
                                 ctx_clone.request_repaint();
                             });
-                            
-                            self.show_move_dialog = false;
+
+                            self.show_transfer_dialog = false;
                         }
                         if ui.button("Cancel").clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                            self.show_move_dialog = false;
+                            self.show_transfer_dialog = false;
                         }
                     });
                 });
@@ -1620,9 +1690,9 @@ impl eframe::App for FaroCommander {
                                 }
                                 ui.checkbox(&mut entry.selected, "");
                                 ui.label(&entry.rel_path);
-                                ui.label(entry.left_size.map(|s| format_size(s, BINARY)).unwrap_or_else(|| "-".to_string()));
+                                ui.label(entry.left_size.map(format_size_binary).unwrap_or_else(|| "-".to_string()));
                                 ui.label(entry.status);
-                                ui.label(entry.right_size.map(|s| format_size(s, BINARY)).unwrap_or_else(|| "-".to_string()));
+                                ui.label(entry.right_size.map(format_size_binary).unwrap_or_else(|| "-".to_string()));
                                 ui.end_row();
                             }
                         });
@@ -1784,9 +1854,16 @@ impl eframe::App for FaroCommander {
                         self.show_rdp_window = true;
                         ui.close_menu();
                     }
-                    ui.separator();
-                    let _ = ui.button(if is_de { "FTP Verbinden..." } else { "FTP Connect..." });
-                    let _ = ui.button(if is_de { "Neue FTP-Verbindung..." } else { "FTP New Connection..." });
+                });
+                ui.menu_button("Tools", |ui| {
+                    if ui.button(if is_de { "📡 Netzwerk-Scanner (Subnetz / Ports / OS / DNS)..." } else { "📡 Network Scanner (Subnet / Ports / OS / DNS)..." }).clicked() {
+                        self.show_net_scanner = true;
+                        ui.close_menu();
+                    }
+                    if ui.button(if is_de { "🔑 Passwort- & PIN-Generator (Sicherheitsanalyse)..." } else { "🔑 Password & PIN Generator (Security Analyzer)..." }).clicked() {
+                        self.show_password_generator = true;
+                        ui.close_menu();
+                    }
                 });
                 ui.menu_button(if is_de { "⚙ Einstellungen" } else { "⚙ Settings" }, |ui| {
                     if ui.button(if is_de { "⚙ Einstellungen öffnen..." } else { "⚙ Open Settings..." }).clicked() {
@@ -1794,7 +1871,7 @@ impl eframe::App for FaroCommander {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("ℹ Info — FARO COMMANDER (C) 2026 R.Trunk").clicked() {
+                    if ui.button(concat!("ℹ Info — FARO COMMANDER v", env!("CARGO_PKG_VERSION"), " (C) 2026 R.Trunk")).clicked() {
                         self.show_about_dialog = true;
                         ui.close_menu();
                     }
@@ -1807,7 +1884,7 @@ impl eframe::App for FaroCommander {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let info_btn = ui.add(
                         egui::Label::new(
-                            egui::RichText::new("FARO COMMANDER (C) 2026 R.Trunk")
+                            egui::RichText::new(concat!("FARO COMMANDER v", env!("CARGO_PKG_VERSION"), " (C) 2026 R.Trunk"))
                                 .strong()
                                 .color(egui::Color32::from_rgb(104, 210, 255)),
                         )
@@ -2648,6 +2725,1554 @@ impl eframe::App for FaroCommander {
             }
         }
 
+        // Process Network Scanner Messages
+        while let Ok(msg) = self.net_scan_rx.try_recv() {
+            use crate::net_scanner::NetScanUiMessage;
+            match msg {
+                NetScanUiMessage::Progress { text, fraction } => {
+                    self.net_scanner.status_text = text;
+                    self.net_scanner.progress_fraction = fraction;
+                }
+                NetScanUiMessage::DiscoverDone { subnet, entries } => {
+                    self.net_scanner.running = false;
+                    self.net_scanner.progress_fraction = None;
+                    self.net_scanner.status_text = format!(
+                        "Subnetz {} abgeschlossen — {} aktive Geräte gefunden.",
+                        subnet,
+                        entries.len()
+                    );
+                    self.net_scanner.discovered_entries = entries;
+                }
+                NetScanUiMessage::InspectDone(res) => {
+                    self.net_scanner.running = false;
+                    self.net_scanner.progress_fraction = None;
+                    self.net_scanner.status_text = format!(
+                        "Host {} ({}) untersucht — {} offene Ports.",
+                        res.host,
+                        res.ip.map(|i| i.to_string()).unwrap_or_default(),
+                        res.open_ports.len()
+                    );
+                    self.net_scanner.inspect_result = Some(*res);
+                }
+                NetScanUiMessage::PortScanDone { host, ip, ports } => {
+                    self.net_scanner.running = false;
+                    self.net_scanner.progress_fraction = None;
+                    let open_ports: Vec<_> = ports.iter().filter(|p| p.open).cloned().collect();
+                    self.net_scanner.status_text = format!(
+                        "Port-Scan auf {} ({}) abgeschlossen — {} offene Ports.",
+                        host,
+                        ip,
+                        open_ports.len()
+                    );
+                    self.net_scanner.inspect_result = Some(netscli_core::InspectResult {
+                        host,
+                        ip: ip.parse().ok(),
+                        ping: None,
+                        ports,
+                        open_ports,
+                        hostname: None,
+                        mac: None,
+                        vendor: None,
+                        os_hint: None,
+                    });
+                }
+                NetScanUiMessage::PingDone(summary) => {
+                    self.net_scanner.running = false;
+                    self.net_scanner.progress_fraction = None;
+                    self.net_scanner.status_text = format!(
+                        "Ping {} ({}) fertig: {}/{} empfangen ({:.0}% Verlust)",
+                        summary.host, summary.ip, summary.received, summary.sent, summary.loss_pct
+                    );
+                    self.net_scanner.ping_result = Some(summary);
+                }
+                NetScanUiMessage::TraceDone(trace) => {
+                    self.net_scanner.running = false;
+                    self.net_scanner.progress_fraction = None;
+                    self.net_scanner.status_text = format!(
+                        "Traceroute zu {} abgeschlossen ({} Zeilen).",
+                        trace.host,
+                        trace.lines.len()
+                    );
+                    self.net_scanner.trace_result = Some(trace);
+                }
+                NetScanUiMessage::DnsDone { host, records } => {
+                    self.net_scanner.running = false;
+                    self.net_scanner.progress_fraction = None;
+                    self.net_scanner.status_text = format!(
+                        "DNS-Lookup für {} abgeschlossen ({} Einträge).",
+                        host,
+                        records.len()
+                    );
+                    self.net_scanner.dns_records = records;
+                }
+                NetScanUiMessage::ArpDone { arp, interfaces } => {
+                    self.net_scanner.running = false;
+                    self.net_scanner.progress_fraction = None;
+                    self.net_scanner.status_text = format!(
+                        "ARP-Tabelle ({} Einträge) & {} Schnittstellen geladen.",
+                        arp.len(),
+                        interfaces.len()
+                    );
+                    self.net_scanner.arp_entries = arp;
+                    self.net_scanner.interfaces = interfaces;
+                }
+                NetScanUiMessage::MdnsDone(services) => {
+                    self.net_scanner.running = false;
+                    self.net_scanner.progress_fraction = None;
+                    self.net_scanner.status_text = format!(
+                        "mDNS-Suche abgeschlossen — {} Dienste im LAN gefunden.",
+                        services.len()
+                    );
+                    self.net_scanner.mdns_services = services;
+                }
+                NetScanUiMessage::Error(err) => {
+                    self.net_scanner.running = false;
+                    self.net_scanner.progress_fraction = None;
+                    self.net_scanner.status_text = "Fehler beim Scan".to_string();
+                    self.net_scanner.error_message = Some(err);
+                }
+            }
+        }
+
+        // Network Scanner Window (Tools -> Netzwerk-Scanner)
+        if self.show_net_scanner {
+            let mut open = self.show_net_scanner;
+            let mut action_inspect_ip: Option<String> = None;
+            let mut action_ssh_ip: Option<String> = None;
+            let mut action_rdp_ip: Option<String> = None;
+
+            egui::Window::new(if is_de {
+                "📡 Netzwerk-Scanner & Diagnose"
+            } else {
+                "📡 Network Scanner & Diagnostics"
+            })
+            .open(&mut open)
+            .default_size([1020.0, 660.0])
+            .min_width(780.0)
+            .min_height(460.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                use crate::net_scanner::{DiagTool, NetScannerTab};
+
+                // Top Tab Bar + Status
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.net_scanner.active_tab,
+                        NetScannerTab::Discover,
+                        if is_de {
+                            "🌐 Subnetz-Scan & Sweep"
+                        } else {
+                            "🌐 Subnet Discover & Sweep"
+                        },
+                    );
+                    ui.selectable_value(
+                        &mut self.net_scanner.active_tab,
+                        NetScannerTab::Inspect,
+                        if is_de {
+                            "🔍 Host-Inspektion & Port-Scanner"
+                        } else {
+                            "🔍 Host Inspect & Port Scanner"
+                        },
+                    );
+                    ui.selectable_value(
+                        &mut self.net_scanner.active_tab,
+                        NetScannerTab::Diagnostics,
+                        if is_de {
+                            "🛠 Diagnose (Ping / Trace / DNS / ARP / mDNS)"
+                        } else {
+                            "🛠 Diagnostics (Ping / Trace / DNS / ARP / mDNS)"
+                        },
+                    );
+                    ui.separator();
+                    ui.label(if is_de { "Parallelität:" } else { "Concurrency:" });
+                    ui.add(
+                        egui::DragValue::new(&mut self.net_scanner.concurrency)
+                            .clamp_range(8..=512)
+                            .speed(4.0),
+                    );
+                    ui.label(if is_de { "Timeout (ms):" } else { "Timeout (ms):" });
+                    ui.add(
+                        egui::DragValue::new(&mut self.net_scanner.scan_timeout_ms)
+                            .clamp_range(100..=5000)
+                            .speed(25.0),
+                    );
+                    ui.separator();
+                    if ui
+                        .button(if is_de { "💾 CSV Export..." } else { "💾 Export CSV..." })
+                        .on_hover_text(if is_de {
+                            "Dialog öffnen, um die aktuellen Scan-Ergebnisse als CSV-Datei zu speichern"
+                        } else {
+                            "Open dialog to save current scan results as CSV file"
+                        })
+                        .clicked()
+                    {
+                        let target_dir = if self.active_pane_is_left {
+                            &self.left_pane.current_path
+                        } else {
+                            &self.right_pane.current_path
+                        };
+                        let default_file = target_dir.join(self.net_scanner.default_csv_filename());
+                        self.net_scanner.export_path_input =
+                            default_file.to_string_lossy().to_string();
+                        self.net_scanner.show_export_dialog = true;
+                    }
+                });
+
+                ui.separator();
+
+                // Progress / Status Bar
+                ui.horizontal(|ui| {
+                    if self.net_scanner.running {
+                        ui.spinner();
+                    }
+                    ui.label(
+                        egui::RichText::new(&self.net_scanner.status_text)
+                            .color(egui::Color32::LIGHT_BLUE)
+                            .strong(),
+                    );
+                    if let Some(frac) = self.net_scanner.progress_fraction {
+                        ui.add(
+                            egui::ProgressBar::new(frac.clamp(0.0, 1.0))
+                                .show_percentage()
+                                .desired_width(220.0),
+                        );
+                    }
+                });
+
+                if let Some(err) = &self.net_scanner.error_message {
+                    ui.colored_label(egui::Color32::from_rgb(255, 100, 100), format!("⚠ {err}"));
+                }
+
+                ui.separator();
+
+                match self.net_scanner.active_tab {
+                    NetScannerTab::Discover => {
+                        ui.horizontal(|ui| {
+                            ui.label(if is_de { "Subnetz (CIDR):" } else { "Subnet (CIDR):" });
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.net_scanner.subnet_input)
+                                    .desired_width(150.0)
+                                    .hint_text("192.168.1.0/24"),
+                            );
+                            if ui
+                                .button(if is_de { "🔄 Auto" } else { "🔄 Auto" })
+                                .on_hover_text(if is_de {
+                                    "Aktuelles Standard-Subnetz automatisch erkennen"
+                                } else {
+                                    "Auto-detect default IPv4 subnet"
+                                })
+                                .clicked()
+                            {
+                                self.net_scanner.subnet_input =
+                                    netscli_core::default_ipv4_subnet_string();
+                            }
+
+                            ui.checkbox(
+                                &mut self.net_scanner.resolve_hostnames,
+                                if is_de {
+                                    "Hostnamen (DNS/mDNS)"
+                                } else {
+                                    "Resolve Hostnames"
+                                },
+                            );
+                            ui.checkbox(
+                                &mut self.net_scanner.with_port_sweep,
+                                if is_de {
+                                    "Mit Port-Sweep"
+                                } else {
+                                    "With Port Sweep"
+                                },
+                            );
+                            if self.net_scanner.with_port_sweep {
+                                ui.label("Ports:");
+                                ui.add(
+                                    egui::TextEdit::singleline(
+                                        &mut self.net_scanner.sweep_ports_input,
+                                    )
+                                    .desired_width(180.0)
+                                    .hint_text("22,80,443,445,3389"),
+                                );
+                            }
+
+                            let scan_btn = ui.add_enabled(
+                                !self.net_scanner.running,
+                                egui::Button::new(
+                                    egui::RichText::new(if is_de {
+                                        "▶ Subnetz scannen"
+                                    } else {
+                                        "▶ Scan Subnet"
+                                    })
+                                    .strong(),
+                                ),
+                            );
+                            if scan_btn.clicked() {
+                                self.net_scanner
+                                    .start_discover(self.net_scan_tx.clone(), ctx.clone());
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label(if is_de { "🔍 Filter:" } else { "🔍 Filter:" });
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.net_scanner.filter_query)
+                                    .desired_width(220.0)
+                                    .hint_text(if is_de {
+                                        "IP, Hostname, MAC oder Hersteller..."
+                                    } else {
+                                        "IP, Hostname, MAC or Vendor..."
+                                    }),
+                            );
+                            if self.net_scanner.with_port_sweep {
+                                ui.checkbox(
+                                    &mut self.net_scanner.only_with_open_ports,
+                                    if is_de {
+                                        "Nur Geräte mit offenen Ports"
+                                    } else {
+                                        "Only hosts with open ports"
+                                    },
+                                );
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(format!(
+                                        "{} {}",
+                                        self.net_scanner.discovered_entries.len(),
+                                        if is_de { "Geräte" } else { "Hosts" }
+                                    ));
+                                },
+                            );
+                        });
+
+                        ui.separator();
+
+                        let q = self.net_scanner.filter_query.trim().to_lowercase();
+                        let only_open =
+                            self.net_scanner.with_port_sweep && self.net_scanner.only_with_open_ports;
+
+                        egui::ScrollArea::vertical()
+                            .id_source("net_discover_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                egui::Grid::new("net_discover_grid")
+                                    .striped(true)
+                                    .min_col_width(70.0)
+                                    .spacing([12.0, 6.0])
+                                    .show(ui, |ui| {
+                                        ui.strong("IP");
+                                        ui.strong(if is_de { "Hostname" } else { "Hostname" });
+                                        ui.strong("MAC");
+                                        ui.strong(if is_de {
+                                            "Hersteller (OUI)"
+                                        } else {
+                                            "Vendor (OUI)"
+                                        });
+                                        ui.strong("Ping / Quelle");
+                                        ui.strong(if is_de {
+                                            "Offene Ports"
+                                        } else {
+                                            "Open Ports"
+                                        });
+                                        ui.strong(if is_de { "Aktionen" } else { "Actions" });
+                                        ui.end_row();
+
+                                        for entry in &self.net_scanner.discovered_entries {
+                                            if only_open && entry.open_ports.is_empty() {
+                                                continue;
+                                            }
+                                            let ip_str = entry.host.ip.to_string();
+                                            let host_str =
+                                                entry.host.hostname.as_deref().unwrap_or("-");
+                                            let mac_str = entry.host.mac.as_deref().unwrap_or("-");
+                                            let vendor_str =
+                                                entry.host.vendor.as_deref().unwrap_or("-");
+
+                                            if !q.is_empty()
+                                                && !ip_str.to_lowercase().contains(&q)
+                                                && !host_str.to_lowercase().contains(&q)
+                                                && !mac_str.to_lowercase().contains(&q)
+                                                && !vendor_str.to_lowercase().contains(&q)
+                                            {
+                                                continue;
+                                            }
+
+                                            ui.monospace(&ip_str);
+                                            let name_badge = match entry.host.hostname_source {
+                                                Some(netscli_core::NameSource::Mdns) => {
+                                                    format!("{host_str} (mDNS)")
+                                                }
+                                                Some(netscli_core::NameSource::Reverse) => {
+                                                    host_str.to_string()
+                                                }
+                                                None => host_str.to_string(),
+                                            };
+                                            ui.label(name_badge);
+                                            ui.monospace(mac_str);
+                                            ui.label(vendor_str);
+
+                                            let rtt_badge = match (
+                                                entry.host.rtt_ms,
+                                                entry.host.found_by,
+                                            ) {
+                                                (Some(ms), _) => format!("{ms} ms"),
+                                                (None, netscli_core::FoundBy::Neighbor) => {
+                                                    "ARP".to_string()
+                                                }
+                                                (None, netscli_core::FoundBy::Probe) => {
+                                                    "<1 ms".to_string()
+                                                }
+                                            };
+                                            ui.label(rtt_badge);
+
+                                            if entry.open_ports.is_empty() {
+                                                ui.label("-");
+                                            } else {
+                                                let ports_summary = entry
+                                                    .open_ports
+                                                    .iter()
+                                                    .map(|p| match &p.service {
+                                                        Some(s) => format!("{}/{}", p.port, s),
+                                                        None => p.port.to_string(),
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                                    .join(", ");
+                                                ui.colored_label(
+                                                    egui::Color32::LIGHT_GREEN,
+                                                    ports_summary,
+                                                );
+                                            }
+
+                                            ui.horizontal(|ui| {
+                                                if ui
+                                                    .small_button(if is_de {
+                                                        "🔍 Inspizieren"
+                                                    } else {
+                                                        "🔍 Inspect"
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    action_inspect_ip = Some(ip_str.clone());
+                                                }
+                                                if ui
+                                                    .small_button("🖥 SSH")
+                                                    .on_hover_text(if is_de {
+                                                        "Im SSH-Terminal öffnen"
+                                                    } else {
+                                                        "Open in SSH Terminal"
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    action_ssh_ip = Some(ip_str.clone());
+                                                }
+                                                if ui
+                                                    .small_button("🖵 RDP")
+                                                    .on_hover_text(if is_de {
+                                                        "Als RDP-Verbindung öffnen"
+                                                    } else {
+                                                        "Open as RDP Connection"
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    action_rdp_ip = Some(ip_str.clone());
+                                                }
+                                            });
+                                            ui.end_row();
+                                        }
+                                    });
+                            });
+                    }
+
+                    NetScannerTab::Inspect => {
+                        ui.horizontal(|ui| {
+                            ui.label(if is_de { "Host / IP:" } else { "Host / IP:" });
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.net_scanner.target_host)
+                                    .desired_width(180.0)
+                                    .hint_text("192.168.1.1 oder example.com"),
+                            );
+                            ui.label("Ports:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.net_scanner.scan_ports_input)
+                                    .desired_width(220.0)
+                                    .hint_text(if is_de {
+                                        "Leer = Standard-Ports, oder z.B. 1-1024"
+                                    } else {
+                                        "Empty = default ports, or e.g. 1-1024"
+                                    }),
+                            );
+                            ui.checkbox(&mut self.net_scanner.use_udp, "UDP");
+                            ui.checkbox(
+                                &mut self.net_scanner.show_closed_ports,
+                                if is_de {
+                                    "Geschlossene zeigen"
+                                } else {
+                                    "Show closed"
+                                },
+                            );
+
+                            if ui
+                                .add_enabled(
+                                    !self.net_scanner.running && !self.net_scanner.use_udp,
+                                    egui::Button::new(
+                                        egui::RichText::new(if is_de {
+                                            "🔍 Voll-Inspektion (inkl. OS)"
+                                        } else {
+                                            "🔍 Full Inspect (incl. OS)"
+                                        })
+                                        .strong(),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                self.net_scanner.start_inspect(
+                                    self.net_scan_tx.clone(),
+                                    ctx.clone(),
+                                    false,
+                                );
+                            }
+
+                            if ui
+                                .add_enabled(
+                                    !self.net_scanner.running,
+                                    egui::Button::new(if is_de {
+                                        "🎯 Nur Port-Scan"
+                                    } else {
+                                        "🎯 Port Scan Only"
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                self.net_scanner.start_inspect(
+                                    self.net_scan_tx.clone(),
+                                    ctx.clone(),
+                                    true,
+                                );
+                            }
+                        });
+
+                        ui.separator();
+
+                        if let Some(res) = &self.net_scanner.inspect_result {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    let ip_str = res
+                                        .ip
+                                        .map(|i| i.to_string())
+                                        .unwrap_or_else(|| res.host.clone());
+                                    ui.strong(format!("Host: {} ({})", res.host, ip_str));
+                                    if let Some(hn) = &res.hostname {
+                                        ui.separator();
+                                        ui.label(format!("DNS: {hn}"));
+                                    }
+                                    if let Some(mac) = &res.mac {
+                                        ui.separator();
+                                        ui.monospace(format!("MAC: {mac}"));
+                                    }
+                                    if let Some(vendor) = &res.vendor {
+                                        ui.label(format!("({vendor})"));
+                                    }
+                                    if let Some(ping) = &res.ping {
+                                        ui.separator();
+                                        let status = if ping.alive {
+                                            format!(
+                                                "Ping: {} ms (TTL: {})",
+                                                ping.rtt_ms.unwrap_or(0),
+                                                ping.ttl
+                                                    .map(|t| t.to_string())
+                                                    .unwrap_or_else(|| "-".to_string())
+                                            )
+                                        } else {
+                                            "Ping: Keine Antwort".to_string()
+                                        };
+                                        ui.label(status);
+                                    }
+                                    ui.separator();
+                                    if ui.small_button("🖥 SSH").clicked() {
+                                        action_ssh_ip = Some(ip_str.clone());
+                                    }
+                                    if ui.small_button("🖵 RDP").clicked() {
+                                        action_rdp_ip = Some(ip_str.clone());
+                                    }
+                                });
+
+                                if let Some(os) = &res.os_hint {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(120, 220, 140),
+                                            format!(
+                                                "💻 {}: {}",
+                                                if is_de {
+                                                    "Erkanntes Betriebssystem"
+                                                } else {
+                                                    "Detected OS"
+                                                },
+                                                os.summary()
+                                            ),
+                                        );
+                                        if !os.evidence.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "[{}]",
+                                                    os.evidence.join(" | ")
+                                                ))
+                                                .small()
+                                                .color(egui::Color32::GRAY),
+                                            );
+                                        }
+                                    });
+                                }
+                            });
+
+                            ui.add_space(4.0);
+
+                            let show_closed = self.net_scanner.show_closed_ports;
+                            egui::ScrollArea::vertical()
+                                .id_source("net_inspect_ports_scroll")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    egui::Grid::new("net_inspect_ports_grid")
+                                        .striped(true)
+                                        .min_col_width(65.0)
+                                        .spacing([12.0, 6.0])
+                                        .show(ui, |ui| {
+                                            ui.strong("Port");
+                                            ui.strong("Status");
+                                            ui.strong(if is_de { "Dienst" } else { "Service" });
+                                            ui.strong(if is_de {
+                                                "Produkt / Version"
+                                            } else {
+                                                "Product / Version"
+                                            });
+                                            ui.strong(if is_de { "Latenz" } else { "Latency" });
+                                            ui.strong("Banner / HTTP / TLS Details");
+                                            ui.end_row();
+
+                                            for p in &res.ports {
+                                                if !show_closed && !p.open {
+                                                    continue;
+                                                }
+                                                ui.monospace(p.port_label());
+                                                let (status_txt, color) = match p.status {
+                                                    netscli_core::PortStatus::Open => {
+                                                        ("OPEN", egui::Color32::LIGHT_GREEN)
+                                                    }
+                                                    netscli_core::PortStatus::OpenFiltered => (
+                                                        "OPEN|FILTERED",
+                                                        egui::Color32::from_rgb(240, 200, 80),
+                                                    ),
+                                                    netscli_core::PortStatus::Filtered => {
+                                                        ("FILTERED", egui::Color32::YELLOW)
+                                                    }
+                                                    netscli_core::PortStatus::Closed => {
+                                                        ("CLOSED", egui::Color32::GRAY)
+                                                    }
+                                                    netscli_core::PortStatus::Error => {
+                                                        ("ERROR", egui::Color32::LIGHT_RED)
+                                                    }
+                                                };
+                                                ui.colored_label(color, status_txt);
+                                                ui.label(p.service.as_deref().unwrap_or("-"));
+                                                ui.label(
+                                                    p.product_and_version()
+                                                        .unwrap_or_else(|| "-".to_string()),
+                                                );
+                                                ui.label(
+                                                    p.latency_ms
+                                                        .map(|ms| format!("{ms} ms"))
+                                                        .unwrap_or_else(|| "-".to_string()),
+                                                );
+
+                                                let mut details = Vec::new();
+                                                if let Some(b) = &p.banner {
+                                                    details.push(format!("Banner: {b}"));
+                                                }
+                                                if let Some(http) = &p.http {
+                                                    if let Some(st) = &http.status_line {
+                                                        details.push(format!("HTTP: {st}"));
+                                                    }
+                                                }
+                                                if let Some(tls) = &p.tls {
+                                                    let proto =
+                                                        tls.protocol.as_deref().unwrap_or("TLS");
+                                                    let cipher =
+                                                        tls.cipher_suite.as_deref().unwrap_or("");
+                                                    details.push(format!("TLS: {proto} {cipher}"));
+                                                }
+                                                ui.label(if details.is_empty() {
+                                                    "-".to_string()
+                                                } else {
+                                                    details.join(" | ")
+                                                });
+                                                ui.end_row();
+                                            }
+                                        });
+                                });
+                        } else {
+                            ui.label(
+                                egui::RichText::new(if is_de {
+                                    "Geben Sie oben eine IP oder einen Hostnamen ein (oder klicken Sie im Subnetz-Scan auf '🔍 Inspizieren')."
+                                } else {
+                                    "Enter an IP or hostname above (or click '🔍 Inspect' in Subnet Scan)."
+                                })
+                                .color(egui::Color32::GRAY),
+                            );
+                        }
+                    }
+
+                    NetScannerTab::Diagnostics => {
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut self.net_scanner.diag_tool,
+                                DiagTool::Ping,
+                                "📶 Ping",
+                            );
+                            ui.selectable_value(
+                                &mut self.net_scanner.diag_tool,
+                                DiagTool::Traceroute,
+                                "🛣 Traceroute",
+                            );
+                            ui.selectable_value(
+                                &mut self.net_scanner.diag_tool,
+                                DiagTool::Dns,
+                                "🌍 DNS-Lookup",
+                            );
+                            ui.selectable_value(
+                                &mut self.net_scanner.diag_tool,
+                                DiagTool::ArpAndInterfaces,
+                                if is_de {
+                                    "🖧 ARP & Schnittstellen"
+                                } else {
+                                    "🖧 ARP & Interfaces"
+                                },
+                            );
+                            ui.selectable_value(
+                                &mut self.net_scanner.diag_tool,
+                                DiagTool::Mdns,
+                                "📡 mDNS / Bonjour",
+                            );
+                        });
+
+                        ui.separator();
+
+                        ui.horizontal(|ui| {
+                            match self.net_scanner.diag_tool {
+                                DiagTool::Ping => {
+                                    ui.label("Host / IP:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.net_scanner.diag_target)
+                                            .desired_width(200.0),
+                                    );
+                                    ui.label(if is_de { "Anzahl:" } else { "Count:" });
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.net_scanner.ping_count)
+                                            .clamp_range(1..=20),
+                                    );
+                                }
+                                DiagTool::Traceroute => {
+                                    ui.label("Host / IP:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.net_scanner.diag_target)
+                                            .desired_width(200.0),
+                                    );
+                                    ui.label("Max Hops:");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.net_scanner.trace_max_hops)
+                                            .clamp_range(1..=64),
+                                    );
+                                    ui.checkbox(
+                                        &mut self.net_scanner.resolve_hostnames,
+                                        if is_de { "Hostnamen auflösen" } else { "Resolve names" },
+                                    );
+                                }
+                                DiagTool::Dns => {
+                                    ui.label("Domain / IP:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.net_scanner.diag_target)
+                                            .desired_width(200.0),
+                                    );
+                                    egui::ComboBox::from_label(if is_de { "Typ" } else { "Type" })
+                                        .selected_text(&self.net_scanner.dns_record_type)
+                                        .show_ui(ui, |ui| {
+                                            for t in [
+                                                "ALL", "A", "AAAA", "MX", "TXT", "NS", "CNAME",
+                                                "SOA", "PTR",
+                                            ] {
+                                                ui.selectable_value(
+                                                    &mut self.net_scanner.dns_record_type,
+                                                    t.to_string(),
+                                                    t,
+                                                );
+                                            }
+                                        });
+                                }
+                                DiagTool::ArpAndInterfaces => {
+                                    ui.label(if is_de {
+                                        "Lokale ARP-Nachbartabelle und aktive Netzwerkadapter"
+                                    } else {
+                                        "Local ARP neighbor table and active network interfaces"
+                                    });
+                                }
+                                DiagTool::Mdns => {
+                                    ui.label(if is_de {
+                                        "Suchdauer (Sekunden):"
+                                    } else {
+                                        "Browse duration (seconds):"
+                                    });
+                                    ui.add(
+                                        egui::DragValue::new(
+                                            &mut self.net_scanner.mdns_timeout_secs,
+                                        )
+                                        .clamp_range(1..=15),
+                                    );
+                                }
+                            }
+
+                            if ui
+                                .add_enabled(
+                                    !self.net_scanner.running,
+                                    egui::Button::new(
+                                        egui::RichText::new(if is_de {
+                                            "▶ Ausführen"
+                                        } else {
+                                            "▶ Run"
+                                        })
+                                        .strong(),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                self.net_scanner
+                                    .start_diagnostics(self.net_scan_tx.clone(), ctx.clone());
+                            }
+                        });
+
+                        ui.separator();
+
+                        egui::ScrollArea::vertical()
+                            .id_source("net_diag_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| match self.net_scanner.diag_tool {
+                                DiagTool::Ping => {
+                                    if let Some(p) = &self.net_scanner.ping_result {
+                                        ui.heading(format!("{} ({})", p.host, p.ip));
+                                        ui.label(format!(
+                                            "Gesendet: {} | Empfangen: {} | Verlust: {:.1}%",
+                                            p.sent, p.received, p.loss_pct
+                                        ));
+                                        if let (Some(min), Some(avg), Some(max)) =
+                                            (p.rtt_ms_min, p.rtt_ms_avg, p.rtt_ms_max)
+                                        {
+                                            ui.colored_label(
+                                                egui::Color32::LIGHT_GREEN,
+                                                format!(
+                                                    "Antwortzeit (RTT): Min = {} ms | Avg = {:.1} ms | Max = {} ms",
+                                                    min, avg, max
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                                DiagTool::Traceroute => {
+                                    if let Some(tr) = &self.net_scanner.trace_result {
+                                        for line in &tr.lines {
+                                            ui.monospace(line);
+                                        }
+                                    }
+                                }
+                                DiagTool::Dns => {
+                                    egui::Grid::new("net_dns_grid")
+                                        .striped(true)
+                                        .spacing([14.0, 6.0])
+                                        .show(ui, |ui| {
+                                            ui.strong("Typ");
+                                            ui.strong("Name");
+                                            ui.strong("Wert");
+                                            ui.strong("TTL");
+                                            ui.end_row();
+                                            for r in &self.net_scanner.dns_records {
+                                                ui.monospace(&r.record_type);
+                                                ui.label(r.name.as_deref().unwrap_or("-"));
+                                                ui.monospace(&r.value);
+                                                ui.label(
+                                                    r.ttl_seconds
+                                                        .map(|s| format!("{s}s"))
+                                                        .unwrap_or_else(|| "-".to_string()),
+                                                );
+                                                ui.end_row();
+                                            }
+                                        });
+                                }
+                                DiagTool::ArpAndInterfaces => {
+                                    ui.strong(if is_de {
+                                        "Netzwerkschnittstellen:"
+                                    } else {
+                                        "Network Interfaces:"
+                                    });
+                                    egui::Grid::new("net_if_grid")
+                                        .striped(true)
+                                        .spacing([12.0, 4.0])
+                                        .show(ui, |ui| {
+                                            ui.strong("Name");
+                                            ui.strong("Status");
+                                            ui.strong("MAC");
+                                            ui.strong("IP-Netze");
+                                            ui.end_row();
+                                            for iface in &self.net_scanner.interfaces {
+                                                ui.label(&iface.name);
+                                                ui.label(if iface.is_up { "UP" } else { "DOWN" });
+                                                ui.monospace(
+                                                    iface
+                                                        .mac
+                                                        .map(|m| m.to_string())
+                                                        .unwrap_or_else(|| "-".to_string()),
+                                                );
+                                                let ips = iface
+                                                    .ips
+                                                    .iter()
+                                                    .map(|i| i.to_string())
+                                                    .collect::<Vec<_>>()
+                                                    .join(", ");
+                                                ui.monospace(ips);
+                                                ui.end_row();
+                                            }
+                                        });
+                                    ui.add_space(10.0);
+                                    ui.strong(if is_de {
+                                        "ARP-Nachbartabelle:"
+                                    } else {
+                                        "ARP Neighbor Table:"
+                                    });
+                                    egui::Grid::new("net_arp_grid")
+                                        .striped(true)
+                                        .spacing([12.0, 4.0])
+                                        .show(ui, |ui| {
+                                            ui.strong("IP");
+                                            ui.strong("MAC");
+                                            ui.strong(if is_de {
+                                                "Hersteller (OUI)"
+                                            } else {
+                                                "Vendor (OUI)"
+                                            });
+                                            ui.strong("Interface");
+                                            ui.end_row();
+                                            for a in &self.net_scanner.arp_entries {
+                                                ui.monospace(a.ip.to_string());
+                                                ui.monospace(a.mac.to_string());
+                                                ui.label(a.vendor.as_deref().unwrap_or("-"));
+                                                ui.label(&a.interface);
+                                                ui.end_row();
+                                            }
+                                        });
+                                }
+                                DiagTool::Mdns => {
+                                    egui::Grid::new("net_mdns_grid")
+                                        .striped(true)
+                                        .spacing([12.0, 4.0])
+                                        .show(ui, |ui| {
+                                            ui.strong("Instanz");
+                                            ui.strong("Dienst-Typ");
+                                            ui.strong("Hostname");
+                                            ui.strong("Port");
+                                            ui.strong("IP-Adressen");
+                                            ui.end_row();
+                                            for s in &self.net_scanner.mdns_services {
+                                                ui.label(&s.full_name);
+                                                ui.monospace(&s.service_type);
+                                                ui.label(&s.hostname);
+                                                ui.monospace(s.port.to_string());
+                                                let ips = s
+                                                    .addresses
+                                                    .iter()
+                                                    .map(|a| a.to_string())
+                                                    .collect::<Vec<_>>()
+                                                    .join(", ");
+                                                ui.monospace(ips);
+                                                ui.end_row();
+                                            }
+                                        });
+                                }
+                            });
+                    }
+                }
+            });
+
+            self.show_net_scanner = open;
+
+            if self.net_scanner.show_export_dialog {
+                let mut dlg_open = self.net_scanner.show_export_dialog;
+                let mut do_save = false;
+                let mut do_cancel = false;
+
+                egui::Window::new(if is_de {
+                    "💾 CSV-Datei speichern unter..."
+                } else {
+                    "💾 Save CSV File As..."
+                })
+                .open(&mut dlg_open)
+                .collapsible(false)
+                .resizable(true)
+                .default_width(560.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(if is_de {
+                        "Zielpfad für den CSV-Export (UTF-8 mit BOM):"
+                    } else {
+                        "Target path for CSV export (UTF-8 with BOM):"
+                    });
+
+                    ui.horizontal(|ui| {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.net_scanner.export_path_input)
+                                .desired_width(420.0)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            do_save = true;
+                        }
+                        if ui
+                            .button(if is_de {
+                                "📂 Durchsuchen..."
+                            } else {
+                                "📂 Browse..."
+                            })
+                            .clicked()
+                        {
+                            if let Some(picked) = crate::net_scanner::NetScannerState::pick_save_csv_path(
+                                &self.net_scanner.export_path_input,
+                            ) {
+                                self.net_scanner.export_path_input = picked;
+                            }
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label(if is_de { "Schnellwahl:" } else { "Quick folder:" });
+                        if ui
+                            .small_button(if is_de {
+                                "⬅ Linkes Dateifenster"
+                            } else {
+                                "⬅ Left Pane"
+                            })
+                            .clicked()
+                        {
+                            let fname = Path::new(&self.net_scanner.export_path_input)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| self.net_scanner.default_csv_filename());
+                            self.net_scanner.export_path_input = self
+                                .left_pane
+                                .current_path
+                                .join(fname)
+                                .to_string_lossy()
+                                .to_string();
+                        }
+                        if ui
+                            .small_button(if is_de {
+                                "➡ Rechtes Dateifenster"
+                            } else {
+                                "➡ Right Pane"
+                            })
+                            .clicked()
+                        {
+                            let fname = Path::new(&self.net_scanner.export_path_input)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| self.net_scanner.default_csv_filename());
+                            self.net_scanner.export_path_input = self
+                                .right_pane
+                                .current_path
+                                .join(fname)
+                                .to_string_lossy()
+                                .to_string();
+                        }
+                    });
+
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(
+                                egui::RichText::new(if is_de {
+                                    "💾 Speichern"
+                                } else {
+                                    "💾 Save"
+                                })
+                                .strong(),
+                            )
+                            .clicked()
+                        {
+                            do_save = true;
+                        }
+                        if ui
+                            .button(if is_de { "Abbrechen" } else { "Cancel" })
+                            .clicked()
+                        {
+                            do_cancel = true;
+                        }
+                    });
+                });
+
+                if do_save {
+                    let target = PathBuf::from(self.net_scanner.export_path_input.trim());
+                    match self.net_scanner.export_csv_to_path(&target) {
+                        Ok(saved) => {
+                            self.net_scanner.error_message = None;
+                            self.net_scanner.status_text =
+                                format!("💾 CSV gespeichert: {}", saved.display());
+                            self.left_pane.refresh();
+                            self.right_pane.refresh();
+                            dlg_open = false;
+                        }
+                        Err(e) => {
+                            self.net_scanner.error_message = Some(e);
+                        }
+                    }
+                }
+                if do_cancel {
+                    dlg_open = false;
+                }
+                self.net_scanner.show_export_dialog = dlg_open;
+            }
+
+            if let Some(ip) = action_inspect_ip {
+                self.net_scanner.target_host = ip;
+                self.net_scanner.active_tab = crate::net_scanner::NetScannerTab::Inspect;
+                self.net_scanner
+                    .start_inspect(self.net_scan_tx.clone(), ctx.clone(), false);
+            }
+            if let Some(ip) = action_ssh_ip {
+                self.ssh_profile_draft.host = ip;
+                self.show_ssh_terminal = true;
+            }
+            if let Some(ip) = action_rdp_ip {
+                self.rdp_profile_draft.host = ip;
+                self.show_rdp_window = true;
+            }
+        }
+
+        // Password & PIN Generator Window (Tools -> Passwort- & PIN-Generator)
+        if self.show_password_generator {
+            let mut open = self.show_password_generator;
+            egui::Window::new(if is_de {
+                "🔑 Passwort- & PIN-Generator"
+            } else {
+                "🔑 Password & PIN Generator"
+            })
+            .open(&mut open)
+            .default_width(540.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                use crate::tools::{PasswordGenMode, PasswordGeneratorState, WordCase};
+
+                ui.horizontal(|ui| {
+                    let prev_mode = self.password_generator.mode;
+                    ui.selectable_value(
+                        &mut self.password_generator.mode,
+                        PasswordGenMode::Words,
+                        if is_de {
+                            "🗣 Wort-Passwort (z.B. ARCTIC-WOLF-XDFG)"
+                        } else {
+                            "🗣 Word Password (e.g. ARCTIC-WOLF-XDFG)"
+                        },
+                    );
+                    ui.selectable_value(
+                        &mut self.password_generator.mode,
+                        PasswordGenMode::Password,
+                        if is_de {
+                            "🔐 Zufallspasswort (Normal)"
+                        } else {
+                            "🔐 Random Password (Normal)"
+                        },
+                    );
+                    ui.selectable_value(
+                        &mut self.password_generator.mode,
+                        PasswordGenMode::Pin,
+                        if is_de { "🔢 Zufalls-PIN" } else { "🔢 Random PIN" },
+                    );
+                    if self.password_generator.mode != prev_mode {
+                        self.password_generator.generate();
+                    }
+                });
+
+                ui.separator();
+
+                match self.password_generator.mode {
+                    PasswordGenMode::Words => {
+                        let mut changed = false;
+                        ui.horizontal(|ui| {
+                            ui.label(if is_de {
+                                "Anzahl Wörter:"
+                            } else {
+                                "Word Count:"
+                            });
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut self.password_generator.word_count,
+                                        1..=6,
+                                    )
+                                    .suffix(if is_de { " Wörter" } else { " words" }),
+                                )
+                                .changed();
+
+                            ui.separator();
+                            ui.label(if is_de {
+                                "Zufalls-Endblock (z.B. -XDFG):"
+                            } else {
+                                "Random Suffix (e.g. -XDFG):"
+                            });
+                            changed |= ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut self.password_generator.word_suffix_len,
+                                        0..=8,
+                                    )
+                                    .suffix(if is_de { " Zeichen" } else { " chars" }),
+                                )
+                                .changed();
+                        });
+
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(if is_de { "Trennzeichen:" } else { "Separator:" });
+                            for (sep, lbl) in [
+                                ("-", "- (Bindestrich)"),
+                                ("_", "_ (Unterstrich)"),
+                                (".", ". (Punkt)"),
+                                (":", ": (Doppelpunkt)"),
+                                (" ", "Leerzeichen"),
+                            ] {
+                                if ui
+                                    .selectable_label(
+                                        self.password_generator.word_separator == sep,
+                                        lbl,
+                                    )
+                                    .clicked()
+                                {
+                                    self.password_generator.word_separator = sep.to_string();
+                                    changed = true;
+                                }
+                            }
+                        });
+
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(if is_de { "Schreibweise:" } else { "Case:" });
+                            for (wc, lbl) in [
+                                (WordCase::Upper, "GROSS (ARCTIC-WOLF)"),
+                                (WordCase::Title, "Titel (Arctic-Wolf)"),
+                                (WordCase::Lower, "klein (arctic-wolf)"),
+                            ] {
+                                if ui
+                                    .selectable_label(self.password_generator.word_case == wc, lbl)
+                                    .clicked()
+                                {
+                                    self.password_generator.word_case = wc;
+                                    changed = true;
+                                }
+                            }
+                            if self.password_generator.word_suffix_len > 0 {
+                                changed |= ui
+                                    .checkbox(
+                                        &mut self.password_generator.word_suffix_digits,
+                                        if is_de {
+                                            "Ziffern im Endblock"
+                                        } else {
+                                            "Digits in suffix"
+                                        },
+                                    )
+                                    .changed();
+                            }
+                        });
+
+                        if changed {
+                            self.password_generator.generate();
+                        }
+                    }
+                    PasswordGenMode::Password => {
+                        ui.horizontal(|ui| {
+                            ui.label(if is_de {
+                                "Passwortlänge:"
+                            } else {
+                                "Password Length:"
+                            });
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut self.password_generator.length, 6..=64)
+                                        .suffix(if is_de { " Zeichen" } else { " chars" }),
+                                )
+                                .changed()
+                            {
+                                self.password_generator.generate();
+                            }
+                        });
+
+                        ui.horizontal_wrapped(|ui| {
+                            let mut changed = false;
+                            changed |= ui
+                                .checkbox(
+                                    &mut self.password_generator.uppercase,
+                                    if is_de { "A-Z Groß" } else { "A-Z Upper" },
+                                )
+                                .changed();
+                            changed |= ui
+                                .checkbox(
+                                    &mut self.password_generator.lowercase,
+                                    if is_de { "a-z Klein" } else { "a-z Lower" },
+                                )
+                                .changed();
+                            changed |= ui
+                                .checkbox(
+                                    &mut self.password_generator.numbers,
+                                    if is_de { "0-9 Zahlen (-n)" } else { "0-9 Numbers (-n)" },
+                                )
+                                .changed();
+                            changed |= ui
+                                .checkbox(
+                                    &mut self.password_generator.symbols,
+                                    if is_de {
+                                        "!@# Sonderzeichen (-s)"
+                                    } else {
+                                        "!@# Symbols (-s)"
+                                    },
+                                )
+                                .changed();
+                            changed |= ui
+                                .checkbox(
+                                    &mut self.password_generator.exclude_ambiguous,
+                                    if is_de {
+                                        "Ohne 0/O/1/l/I"
+                                    } else {
+                                        "No 0/O/1/l/I"
+                                    },
+                                )
+                                .changed();
+                            if changed {
+                                if !self.password_generator.uppercase
+                                    && !self.password_generator.lowercase
+                                    && !self.password_generator.numbers
+                                    && !self.password_generator.symbols
+                                {
+                                    self.password_generator.lowercase = true;
+                                }
+                                self.password_generator.generate();
+                            }
+                        });
+                    }
+                    PasswordGenMode::Pin => {
+                        ui.horizontal(|ui| {
+                            ui.label(if is_de { "PIN-Länge:" } else { "PIN Length:" });
+                            if ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut self.password_generator.pin_length,
+                                        4..=16,
+                                    )
+                                    .suffix(if is_de { " Ziffern" } else { " digits" }),
+                                )
+                                .changed()
+                            {
+                                self.password_generator.generate();
+                            }
+                        });
+                    }
+                }
+
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.password_generator.current)
+                            .font(egui::FontId::monospace(17.0))
+                            .desired_width(340.0),
+                    );
+                    if ui
+                        .button(
+                            egui::RichText::new(if is_de {
+                                "🎲 Neu generieren"
+                            } else {
+                                "🎲 Generate"
+                            })
+                            .strong(),
+                        )
+                        .clicked()
+                    {
+                        self.password_generator.generate();
+                    }
+                    if ui
+                        .button(if is_de {
+                            "📋 Kopieren"
+                        } else {
+                            "📋 Copy"
+                        })
+                        .clicked()
+                    {
+                        ctx.copy_text(self.password_generator.current.clone());
+                        self.password_generator.copied_notice = true;
+                    }
+                });
+
+                if self.password_generator.copied_notice {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_GREEN,
+                        if is_de {
+                            "✔ In die Zwischenablage kopiert!"
+                        } else {
+                            "✔ Copied to clipboard!"
+                        },
+                    );
+                }
+
+                ui.separator();
+
+                // Security & Crack-Time Analysis (zxcvbn dictionary + pattern engine)
+                let analysis =
+                    PasswordGeneratorState::analyze(&self.password_generator.current, is_de);
+                let (score_label, score_color) = match analysis.score {
+                    0 => (
+                        if is_de { "0/4 — Sehr schwach" } else { "0/4 — Very Weak" },
+                        egui::Color32::from_rgb(230, 70, 70),
+                    ),
+                    1 => (
+                        if is_de { "1/4 — Schwach" } else { "1/4 — Weak" },
+                        egui::Color32::from_rgb(240, 140, 60),
+                    ),
+                    2 => (
+                        if is_de { "2/4 — Mittel" } else { "2/4 — Fair" },
+                        egui::Color32::from_rgb(235, 200, 60),
+                    ),
+                    3 => (
+                        if is_de { "3/4 — Stark" } else { "3/4 — Strong" },
+                        egui::Color32::from_rgb(120, 210, 95),
+                    ),
+                    _ => (
+                        if is_de { "4/4 — Sehr stark" } else { "4/4 — Very Strong" },
+                        egui::Color32::from_rgb(60, 220, 120),
+                    ),
+                };
+
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(if is_de {
+                            "🛡 zxcvbn Sicherheitsanalyse:"
+                        } else {
+                            "🛡 zxcvbn Security Analysis:"
+                        });
+                        ui.colored_label(score_color, egui::RichText::new(score_label).strong());
+                        ui.label(format!(
+                            "({:.1} Bits | ~{} Guesses)",
+                            analysis.entropy_bits, analysis.guesses
+                        ));
+                    });
+
+                    ui.add(
+                        egui::ProgressBar::new((analysis.score as f32 / 4.0).clamp(0.08, 1.0))
+                            .fill(score_color),
+                    );
+
+                    if let Some(warn) = &analysis.warning {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 160, 80),
+                            format!("⚠ {warn}"),
+                        );
+                    }
+                    for sug in &analysis.suggestions {
+                        ui.label(
+                            egui::RichText::new(format!("💡 {sug}"))
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
+                    }
+
+                    ui.add_space(4.0);
+                    ui.strong(if is_de {
+                        "Geschätzte Knackdauer (Crack-Time Estimations):"
+                    } else {
+                        "Crack-Time Estimations:"
+                    });
+                    egui::Grid::new("pw_crack_grid")
+                        .striped(true)
+                        .spacing([16.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label(if is_de {
+                                "Online gedrosselt (100 / Std.):"
+                            } else {
+                                "Online throttled (100 / h):"
+                            });
+                            ui.monospace(&analysis.crack_100_per_hour);
+                            ui.end_row();
+
+                            ui.label(if is_de {
+                                "Online ungedrosselt (10 / Sek.):"
+                            } else {
+                                "Online unthrottled (10 / s):"
+                            });
+                            ui.monospace(&analysis.crack_10_per_sec);
+                            ui.end_row();
+
+                            ui.label(if is_de {
+                                "Offline langsamer Hash — bcrypt/Argon2 (10⁴ / Sek.):"
+                            } else {
+                                "Offline slow hash — bcrypt/Argon2 (10⁴ / s):"
+                            });
+                            ui.monospace(&analysis.crack_1e4_per_sec);
+                            ui.end_row();
+
+                            ui.label(if is_de {
+                                "Offline schneller GPU-Hash — MD5/SHA (10¹⁰ / Sek.):"
+                            } else {
+                                "Offline fast GPU hash — MD5/SHA (10¹⁰ / s):"
+                            });
+                            ui.monospace(&analysis.crack_1e10_per_sec);
+                            ui.end_row();
+                        });
+                });
+
+                if !self.password_generator.history.is_empty() {
+                    ui.add_space(6.0);
+                    ui.collapsing(
+                        if is_de {
+                            "🕘 Zuletzt generiert"
+                        } else {
+                            "🕘 Recently Generated"
+                        },
+                        |ui| {
+                            let mut pick_hist: Option<String> = None;
+                            for h in &self.password_generator.history {
+                                ui.horizontal(|ui| {
+                                    ui.monospace(h);
+                                    if ui
+                                        .small_button(if is_de { "📋" } else { "📋" })
+                                        .on_hover_text(if is_de {
+                                            "Kopieren"
+                                        } else {
+                                            "Copy"
+                                        })
+                                        .clicked()
+                                    {
+                                        ctx.copy_text(h.clone());
+                                        self.password_generator.copied_notice = true;
+                                    }
+                                    if ui
+                                        .small_button(if is_de {
+                                            "Übernehmen"
+                                        } else {
+                                            "Use"
+                                        })
+                                        .clicked()
+                                    {
+                                        pick_hist = Some(h.clone());
+                                    }
+                                });
+                            }
+                            if let Some(p) = pick_hist {
+                                self.password_generator.current = p;
+                            }
+                        },
+                    );
+                }
+            });
+            self.show_password_generator = open;
+        }
+
         // Process Editor Messages
         while let Ok(msg) = self.editor_rx.try_recv() {
             match msg {
@@ -3330,38 +4955,30 @@ impl FaroCommander {
         list
     }
     
-    fn action_copy(&mut self) {
+    fn open_transfer_dialog(&mut self, is_move: bool) {
         let active_pane = if self.active_pane_is_left { &self.left_pane } else { &self.right_pane };
         let target_pane = if self.active_pane_is_left { &self.right_pane } else { &self.left_pane };
         let targets = Self::collect_target_files(active_pane);
         if !targets.is_empty() {
             if targets.len() == 1 {
-                self.copy_source_path = targets[0].0.clone();
-                self.copy_target_path = target_pane.current_path.join(&targets[0].1).to_string_lossy().to_string();
+                self.transfer_source_path = targets[0].0.clone();
+                self.transfer_target_path = target_pane.current_path.join(&targets[0].1).to_string_lossy().to_string();
             } else {
-                self.copy_source_path = format!("{} selected items", targets.len());
-                self.copy_target_path = target_pane.current_path.to_string_lossy().to_string();
+                self.transfer_source_path = format!("{} selected items", targets.len());
+                self.transfer_target_path = target_pane.current_path.to_string_lossy().to_string();
             }
-            self.copy_sources = targets;
-            self.show_copy_dialog = true;
+            self.transfer_sources = targets;
+            self.transfer_is_move = is_move;
+            self.show_transfer_dialog = true;
         }
     }
-    
+
+    fn action_copy(&mut self) {
+        self.open_transfer_dialog(false);
+    }
+
     fn action_move(&mut self) {
-        let active_pane = if self.active_pane_is_left { &self.left_pane } else { &self.right_pane };
-        let target_pane = if self.active_pane_is_left { &self.right_pane } else { &self.left_pane };
-        let targets = Self::collect_target_files(active_pane);
-        if !targets.is_empty() {
-            if targets.len() == 1 {
-                self.move_source_path = targets[0].0.clone();
-                self.move_target_path = target_pane.current_path.join(&targets[0].1).to_string_lossy().to_string();
-            } else {
-                self.move_source_path = format!("{} selected items", targets.len());
-                self.move_target_path = target_pane.current_path.to_string_lossy().to_string();
-            }
-            self.move_sources = targets;
-            self.show_move_dialog = true;
-        }
+        self.open_transfer_dialog(true);
     }
 
     fn action_inline_rename(&mut self) {
@@ -3867,8 +5484,7 @@ impl FaroCommander {
                 let mut cancel_rename = false;
                 
                 // Handle keyboard navigation & Multi-Select (Insert / Space / Shift+Arrows / Ctrl+A)
-                let no_modal = !self.show_copy_dialog
-                    && !self.show_move_dialog
+                let no_modal = !self.show_transfer_dialog
                     && !self.show_mkdir_dialog
                     && !self.show_delete_dialog
                     && !self.show_search_dialog
@@ -4010,7 +5626,7 @@ impl FaroCommander {
                             ("[..]".to_string(), "".to_string(), "<DIR>".to_string(), "".to_string())
                         } else if file.is_dir {
                             let sz_label = if let Some(&calc_sz) = pane.calculated_dir_sizes.get(&file.name) {
-                                format_size(calc_sz, BINARY)
+                                format_size_binary(calc_sz)
                             } else {
                                 "<DIR>".to_string()
                             };
@@ -4018,7 +5634,7 @@ impl FaroCommander {
                             (format!("[{}]", file.name), "".to_string(), sz_label, date_str)
                         } else {
                             let date_str = file.modified.map(|d| d.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
-                            (file.name.clone(), file.ext.clone(), format_size(file.size, BINARY), date_str)
+                            (file.name.clone(), file.ext.clone(), format_size_binary(file.size), date_str)
                         };
 
                         body.row(20.0, |mut row| {
@@ -4221,7 +5837,7 @@ fn main() -> Result<(), eframe::Error> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1200.0, 800.0])
-        .with_title("FaroCommander");
+        .with_title(concat!("FaroCommander v", env!("CARGO_PKG_VERSION")));
 
     if let Ok(img) = image::load_from_memory(include_bytes!("../LOGO.png")) {
         let rgba = img.to_rgba8();

@@ -448,3 +448,268 @@ pub fn apply_theme(ctx: &eframe::egui::Context, theme: AppTheme) {
     ctx.set_visuals(visuals);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PasswordGenMode {
+    #[default]
+    Password,
+    Words,
+    Pin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WordCase {
+    #[default]
+    Upper,
+    Title,
+    Lower,
+}
+
+const WORD_LIST: &[&str] = &[
+    "ARCTIC", "WOLF", "FALCON", "SOLAR", "COBALT", "PHOENIX", "THUNDER", "GLACIER", "QUANTUM",
+    "NEXUS", "TITAN", "SHADOW", "SILVER", "ORBIT", "MATRIX", "VECTOR", "CRYSTAL", "VORTEX",
+    "CYBER", "EMBER", "STORM", "HORIZON", "AURORA", "COSMIC", "DELTA", "OMEGA", "STELLAR",
+    "NEBULA", "APEX", "PRISM", "VALKYRIE", "KRAKEN", "GRANITE", "OBSIDIAN", "ZENITH", "ECLIPSE",
+    "MIRAGE", "TEMPEST", "VANGUARD", "SENTINEL", "NOMAD", "ATLAS", "COMET", "PULSAR", "METEOR",
+    "ONYX", "JADE", "TOPAZ", "AMBER", "CRIMSON", "INDIGO", "SCARLET", "PANTHER", "TIGER", "EAGLE",
+    "HAWK", "RAVEN", "LYNX", "COBRA", "VIPER", "BISON", "MANTIS", "DRAGON", "GRIFFIN", "HYDRA",
+    "PEGASUS", "SPARTAN", "VIKING", "SAMURAI", "KNIGHT", "RANGER", "PILOT", "CAPTAIN", "BEACON",
+    "FORTRESS", "CITADEL", "BASTION", "BUNKER", "HARBOR", "ANCHOR", "COMPASS", "RADAR", "SONAR",
+    "LASER", "PLASMA", "PHOTON", "PROTON", "NEUTRON", "GRAVITY", "MAGNET", "TURBO", "DYNAMO",
+    "REACTOR", "ENGINE", "ROCKET", "SHUTTLE", "CAPSULE", "SATELLITE", "VOYAGER", "PIONEER",
+    "ODYSSEY", "GENESIS", "INFINITY", "PARADOX", "ENIGMA", "CIPHER", "TOKEN", "VAULT", "SHIELD",
+    "ARMOR", "BLADE", "ARROW", "LANCE", "HAMMER", "ANVIL", "FORGE", "SPARK", "FLAME", "BLAZE",
+    "FROST", "BLIZZARD", "TUNDRA", "TAIGA", "CANYON", "SUMMIT", "RIDGE", "VALLEY", "LAGOON",
+    "CORAL", "OCEAN", "PACIFIC", "ATLANTIC", "NORDIC", "ALPINE", "SAHARA", "AMAZON", "EVEREST",
+    "OLYMPUS", "ANDES", "SIERRA", "SEQUOIA", "REDWOOD", "CEDAR", "MAPLE", "BIRCH", "WILLOW",
+    "LOTUS", "ORCHID", "BAMBOO", "CACTUS", "CLOVER", "ACORN", "WALNUT", "ALMOND", "MANGO",
+    "CITRUS", "PEPPER", "GINGER", "SAFFRON", "VANILLA", "COCOA", "COFFEE", "NECTAR", "ELIXIR",
+    "VELVET", "MARBLE", "QUARTZ", "BASALT", "COPPER", "BRONZE", "NICKEL", "CHROME", "PLATINUM",
+    "TITANIUM", "CARBON", "SILICON", "ARGON", "NEON", "XENON", "HELIUM", "LITHIUM", "ZIRCON",
+];
+
+pub struct PasswordSecurityAnalysis {
+    pub entropy_bits: f64,
+    pub guesses: u64,
+    pub score: u8, // 0..=4
+    pub crack_100_per_hour: String,
+    pub crack_10_per_sec: String,
+    pub crack_1e4_per_sec: String,
+    pub crack_1e10_per_sec: String,
+    pub warning: Option<String>,
+    pub suggestions: Vec<String>,
+}
+
+pub struct PasswordGeneratorState {
+    pub mode: PasswordGenMode,
+    pub length: usize,
+    pub pin_length: usize,
+    pub uppercase: bool,
+    pub lowercase: bool,
+    pub numbers: bool,
+    pub symbols: bool,
+    pub exclude_ambiguous: bool,
+    // Words / Passphrase options (e.g. ARCTIC-WOLF-XDFG)
+    pub word_count: usize,
+    pub word_separator: String,
+    pub word_case: WordCase,
+    pub word_suffix_len: usize,
+    pub word_suffix_digits: bool,
+    pub current: String,
+    pub history: Vec<String>,
+    pub copied_notice: bool,
+}
+
+impl Default for PasswordGeneratorState {
+    fn default() -> Self {
+        let mut s = Self {
+            mode: PasswordGenMode::Words,
+            length: 16,
+            pin_length: 6,
+            uppercase: true,
+            lowercase: true,
+            numbers: true,
+            symbols: true,
+            exclude_ambiguous: false,
+            word_count: 2,
+            word_separator: "-".to_string(),
+            word_case: WordCase::Upper,
+            word_suffix_len: 4,
+            word_suffix_digits: false,
+            current: String::new(),
+            history: Vec::new(),
+            copied_notice: false,
+        };
+        s.generate();
+        s
+    }
+}
+
+impl PasswordGeneratorState {
+    pub fn generate(&mut self) {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let rng = SystemRandom::new();
+        let rand_usize = |bound: usize| -> usize {
+            if bound <= 1 {
+                return 0;
+            }
+            let mut buf = [0u8; 8];
+            let _ = rng.fill(&mut buf);
+            (u64::from_le_bytes(buf) as usize) % bound
+        };
+
+        let result = match self.mode {
+            PasswordGenMode::Pin => {
+                let digits = b"0123456789";
+                (0..self.pin_length.clamp(3, 32))
+                    .map(|_| digits[rand_usize(digits.len())] as char)
+                    .collect::<String>()
+            }
+            PasswordGenMode::Words => {
+                let count = self.word_count.clamp(1, 8);
+                let mut parts: Vec<String> = Vec::with_capacity(count + 1);
+                for _ in 0..count {
+                    let raw = WORD_LIST[rand_usize(WORD_LIST.len())];
+                    let formatted = match self.word_case {
+                        WordCase::Upper => raw.to_uppercase(),
+                        WordCase::Lower => raw.to_lowercase(),
+                        WordCase::Title => {
+                            let mut c = raw.chars();
+                            match c.next() {
+                                Some(first) => {
+                                    first.to_uppercase().collect::<String>()
+                                        + &c.as_str().to_lowercase()
+                                }
+                                None => String::new(),
+                            }
+                        }
+                    };
+                    parts.push(formatted);
+                }
+                if self.word_suffix_len > 0 {
+                    let charset: &[u8] = match (self.word_case, self.word_suffix_digits) {
+                        (WordCase::Lower, false) => b"abcdefghjkmnpqrstuvwxyz",
+                        (WordCase::Lower, true) => b"abcdefghjkmnpqrstuvwxyz23456789",
+                        (_, false) => b"ABCDEFGHJKLMNPQRSTUVWXYZ",
+                        (_, true) => b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789",
+                    };
+                    let suffix: String = (0..self.word_suffix_len.clamp(1, 12))
+                        .map(|_| charset[rand_usize(charset.len())] as char)
+                        .collect();
+                    parts.push(suffix);
+                }
+                parts.join(&self.word_separator)
+            }
+            PasswordGenMode::Password => {
+                let ambig = |c: &char| matches!(c, '0' | 'O' | 'o' | '1' | 'l' | 'I' | '|');
+                let mut sets: Vec<(Vec<char>, usize)> = Vec::new();
+                if self.lowercase {
+                    let v: Vec<char> = ('a'..='z')
+                        .filter(|c| !self.exclude_ambiguous || !ambig(c))
+                        .collect();
+                    sets.push((v, 30));
+                }
+                if self.uppercase {
+                    let v: Vec<char> = ('A'..='Z')
+                        .filter(|c| !self.exclude_ambiguous || !ambig(c))
+                        .collect();
+                    sets.push((v, 30));
+                }
+                if self.numbers {
+                    let v: Vec<char> = ('0'..='9')
+                        .filter(|c| !self.exclude_ambiguous || !ambig(c))
+                        .collect();
+                    sets.push((v, 20));
+                }
+                if self.symbols {
+                    let v: Vec<char> = "~`!@#$%^&*()-_+={}[]|\\:;\"',.<>/?"
+                        .chars()
+                        .filter(|c| !self.exclude_ambiguous || !ambig(c))
+                        .collect();
+                    sets.push((v, 20));
+                }
+                if sets.is_empty() {
+                    sets.push((('a'..='z').collect(), 100));
+                }
+
+                let len = self.length.clamp(4, 128);
+                let mut chars: Vec<char> = Vec::with_capacity(len);
+                for (set, _) in sets.iter().take(len) {
+                    if !set.is_empty() {
+                        chars.push(set[rand_usize(set.len())]);
+                    }
+                }
+                let total_weight: usize = sets.iter().map(|(_, w)| *w).sum();
+                while chars.len() < len {
+                    let mut pick = rand_usize(total_weight);
+                    for (set, w) in &sets {
+                        if pick < *w {
+                            chars.push(set[rand_usize(set.len())]);
+                            break;
+                        }
+                        pick -= *w;
+                    }
+                }
+                for i in (1..chars.len()).rev() {
+                    let j = rand_usize(i + 1);
+                    chars.swap(i, j);
+                }
+                chars.into_iter().collect()
+            }
+        };
+
+        if !self.current.is_empty() && self.history.first() != Some(&self.current) {
+            self.history.insert(0, self.current.clone());
+            self.history.truncate(8);
+        }
+        self.current = result;
+        self.copied_notice = false;
+    }
+
+    pub fn analyze(pw: &str, is_de: bool) -> PasswordSecurityAnalysis {
+        if pw.is_empty() {
+            let instant = if is_de { "Sofort" } else { "Instant" }.to_string();
+            return PasswordSecurityAnalysis {
+                entropy_bits: 0.0,
+                guesses: 0,
+                score: 0,
+                crack_100_per_hour: instant.clone(),
+                crack_10_per_sec: instant.clone(),
+                crack_1e4_per_sec: instant.clone(),
+                crack_1e10_per_sec: instant,
+                warning: None,
+                suggestions: Vec::new(),
+            };
+        }
+
+        let entropy = zxcvbn::zxcvbn(pw, &[]);
+        let guesses = entropy.guesses();
+        let entropy_bits = if guesses > 0 {
+            (guesses as f64).log2()
+        } else {
+            0.0
+        };
+        let score: u8 = entropy.score().into();
+        let ct = entropy.crack_times();
+
+        let (warning, suggestions) = match entropy.feedback() {
+            Some(fb) => (
+                fb.warning().map(|w| w.to_string()),
+                fb.suggestions().iter().map(|s| s.to_string()).collect(),
+            ),
+            None => (None, Vec::new()),
+        };
+
+        PasswordSecurityAnalysis {
+            entropy_bits,
+            guesses,
+            score,
+            crack_100_per_hour: ct.online_throttling_100_per_hour().to_string(),
+            crack_10_per_sec: ct.online_no_throttling_10_per_second().to_string(),
+            crack_1e4_per_sec: ct.offline_slow_hashing_1e4_per_second().to_string(),
+            crack_1e10_per_sec: ct.offline_fast_hashing_1e10_per_second().to_string(),
+            warning,
+            suggestions,
+        }
+    }
+}
+

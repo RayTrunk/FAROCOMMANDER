@@ -34,63 +34,19 @@ pub async fn connect_sftp(
 
 pub async fn list_sftp_dir(sftp: &SftpSession, path: &str) -> Result<Vec<FileEntry>, String> {
     let mut dir = sftp.read_dir(path).await.map_err(|e| e.to_string())?;
-    
-    let mut dirs = Vec::new();
-    let mut files = Vec::new();
-    
-    // Add parent directory entry if not at root
-    if path != "." && path != "/" && path != "" {
-        dirs.push(FileEntry {
-            name: "..".to_string(),
-            ext: String::new(),
-            is_dir: true,
-            size: 0,
-            modified: None,
-        });
+    let mut entries = Vec::new();
+    if path != "." && path != "/" && !path.is_empty() {
+        entries.push(FileEntry::parent_dir());
     }
-    
     while let Some(item) = dir.next() {
         let metadata = item.metadata();
-        let is_dir = metadata.is_dir();
-        
-        // russh-sftp's ReadDir iterator automatically filters out "." and ".."
-        // so we don't need to manually skip them here.
-
-        let size = metadata.len();
-        let modified = metadata.modified().ok()
-            .map(|sys_time| chrono::DateTime::from(sys_time));
-
-        let filename = item.file_name();
-        
-        let (name, ext) = if is_dir {
-            (filename.clone(), "".to_string())
-        } else {
-            let p = std::path::Path::new(&filename);
-            let n = p.file_stem().unwrap_or_default().to_string_lossy().to_string();
-            let e = p.extension().unwrap_or_default().to_string_lossy().to_string();
-            (n, e)
-        };
-
-        let entry = FileEntry {
-            name: if is_dir { filename } else { name },
-            ext,
-            is_dir,
-            size,
+        let modified = metadata.modified().ok().map(chrono::DateTime::from);
+        entries.push(FileEntry::from_filename(
+            item.file_name(),
+            metadata.is_dir(),
+            metadata.len(),
             modified,
-        };
-
-        if is_dir {
-            dirs.push(entry);
-        } else {
-            files.push(entry);
-        }
+        ));
     }
-    
-    // Sort alphabetically, ignoring the first item if it's ".."
-    let start_idx = if !dirs.is_empty() && dirs[0].name == ".." { 1 } else { 0 };
-    dirs[start_idx..].sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    
-    dirs.extend(files);
-    Ok(dirs)
+    Ok(entries)
 }
