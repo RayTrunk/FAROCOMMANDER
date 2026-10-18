@@ -1,0 +1,52 @@
+name: Linux CI & Release Build
+
+on:
+  push:
+    branches: [ master, linux ]
+  pull_request:
+    branches: [ master, linux ]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Build Linux (x86_64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libfontconfig1-dev libpcap-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --verbose
+
+      - name: Package Linux tarball
+        run: |
+          mkdir -p package/farocommander
+          cp target/release/farocommander package/farocommander/
+          cp LICENSE package/farocommander/
+          cp README.md package/farocommander/
+          cat << 'EOF' > package/farocommander/farocommander.desktop
+          [Desktop Entry]
+          Name=FaroCommander
+          Comment=Dual-Pane File Manager and Network Suite
+          Exec=farocommander
+          Icon=farocommander
+          Terminal=false
+          Type=Application
+          Categories=Utility;FileManager;
+          EOF
+          tar -czvf farocommander-v0.8.3-linux-x86_64.tar.gz -C package farocommander
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: farocommander-linux-x86_64
+          path: farocommander-v0.8.3-linux-x86_64.tar.gz
