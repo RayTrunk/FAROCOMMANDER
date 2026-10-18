@@ -2,9 +2,11 @@ use chrono::{DateTime, Local};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -271,33 +273,68 @@ pub fn compute_hashes_or_dir_stats(
 }
 
 pub fn open_with_system_default(path_str: &str) {
-    let _ = std::process::Command::new("cmd.exe")
-        .args(["/C", "start", "", path_str])
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
-}
-
-pub fn open_terminal_in_dir(dir_str: &str, use_powershell: bool) {
-    if use_powershell {
+    #[cfg(windows)]
+    {
         let _ = std::process::Command::new("cmd.exe")
-            .args(["/C", "start", "powershell.exe", "-NoExit", "-Command", &format!("Set-Location -LiteralPath '{}'", dir_str.replace('\'', "''"))])
+            .args(["/C", "start", "", path_str])
             .creation_flags(CREATE_NO_WINDOW)
             .spawn();
-    } else {
-        let _ = std::process::Command::new("cmd.exe")
-            .args(["/C", "start", "cmd.exe", "/K", &format!("cd /d \"{}\"", dir_str)])
-            .creation_flags(CREATE_NO_WINDOW)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(path_str)
             .spawn();
     }
 }
 
-pub fn run_command_capture(dir_str: &str, cmd_line: &str) -> String {
-    match std::process::Command::new("cmd.exe")
-        .args(["/C", cmd_line])
-        .current_dir(dir_str)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
+pub fn open_terminal_in_dir(dir_str: &str, use_powershell: bool) {
+    #[cfg(windows)]
     {
+        if use_powershell {
+            let _ = std::process::Command::new("cmd.exe")
+                .args(["/C", "start", "powershell.exe", "-NoExit", "-Command", &format!("Set-Location -LiteralPath '{}'", dir_str.replace('\'', "''"))])
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+        } else {
+            let _ = std::process::Command::new("cmd.exe")
+                .args(["/C", "start", "cmd.exe", "/K", &format!("cd /d \"{}\"", dir_str)])
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = use_powershell;
+        // On Linux, try common terminal emulators
+        let terminals = ["x-terminal-emulator", "gnome-terminal", "konsole", "xfce4-terminal", "alacritty", "kitty", "foot", "xterm"];
+        for term in terminals {
+            if let Ok(mut child) = std::process::Command::new(term)
+                .current_dir(dir_str)
+                .spawn()
+            {
+                let _ = child;
+                return;
+            }
+        }
+    }
+}
+
+pub fn run_command_capture(dir_str: &str, cmd_line: &str) -> String {
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd.exe");
+        c.args(["/C", cmd_line]).creation_flags(CREATE_NO_WINDOW);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", cmd_line]);
+        c
+    };
+
+    match cmd.current_dir(dir_str).output() {
         Ok(out) => {
             let mut res = String::new();
             let stdout = String::from_utf8_lossy(&out.stdout);

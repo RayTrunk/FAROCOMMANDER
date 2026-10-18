@@ -503,17 +503,43 @@ impl NetScannerState {
     }
 
     pub fn pick_save_csv_path(initial_path: &str) -> Option<String> {
-        let escaped = initial_path.replace('\'', "''");
-        let script = format!(
-            "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.SaveFileDialog; $d.Filter = 'CSV-Datei (*.csv)|*.csv|Alle Dateien (*.*)|*.*'; $d.FileName = '{}'; if ($d.ShowDialog() -eq 'OK') {{ Write-Output $d.FileName }}",
-            escaped
-        );
-        let out = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Sta", "-WindowStyle", "Hidden", "-Command", &script])
-            .output()
-            .ok()?;
-        let picked = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if picked.is_empty() { None } else { Some(picked) }
+        #[cfg(windows)]
+        {
+            let escaped = initial_path.replace('\'', "''");
+            let script = format!(
+                "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.SaveFileDialog; $d.Filter = 'CSV-Datei (*.csv)|*.csv|Alle Dateien (*.*)|*.*'; $d.FileName = '{}'; if ($d.ShowDialog() -eq 'OK') {{ Write-Output $d.FileName }}",
+                escaped
+            );
+            let out = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Sta", "-WindowStyle", "Hidden", "-Command", &script])
+                .output()
+                .ok()?;
+            let picked = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if picked.is_empty() { None } else { Some(picked) }
+        }
+        #[cfg(not(windows))]
+        {
+            // Try zenity or kdialog if present on Linux desktop
+            if let Ok(out) = std::process::Command::new("zenity")
+                .args(["--file-selection", "--save", "--confirm-overwrite", &format!("--filename={}", initial_path)])
+                .output()
+            {
+                let picked = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !picked.is_empty() {
+                    return Some(picked);
+                }
+            }
+            if let Ok(out) = std::process::Command::new("kdialog")
+                .args(["--getsavefilename", initial_path, "*.csv|CSV Files"])
+                .output()
+            {
+                let picked = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !picked.is_empty() {
+                    return Some(picked);
+                }
+            }
+            Some(initial_path.to_string())
+        }
     }
 
     pub fn export_csv_to_path(&self, raw_path: &std::path::Path) -> Result<std::path::PathBuf, String> {

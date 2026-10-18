@@ -509,9 +509,14 @@ impl Default for FaroCommander {
         let (search_tx, search_rx) = std::sync::mpsc::channel();
         let (props_tx, props_rx) = std::sync::mpsc::channel();
         let (net_scan_tx, net_scan_rx) = std::sync::mpsc::channel();
+        #[cfg(windows)]
+        let (initial_left, initial_right) = ("C:\\", "C:\\");
+        #[cfg(not(windows))]
+        let (initial_left, initial_right) = ("/", "/");
+
         Self {
-            left_pane: PaneState::new("C:\\"),
-            right_pane: PaneState::new("C:\\"),
+            left_pane: PaneState::new(initial_left),
+            right_pane: PaneState::new(initial_right),
             active_pane_is_left: true,
             show_transfer_dialog: false,
             transfer_is_move: false,
@@ -1744,23 +1749,38 @@ impl eframe::App for FaroCommander {
                 ui.horizontal(|ui| {
                     ui.colored_label(egui::Color32::LIGHT_BLUE, egui::RichText::new(format!("{}>", cwd_str)).monospace());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let ps_btn = ui.button("⚡ PowerShell").on_hover_text(if is_de {
-                            "PowerShell in diesem Ordner öffnen"
-                        } else {
-                            "Open PowerShell in this folder"
-                        });
-                        if ps_btn.has_focus() { ps_btn.surrender_focus(); }
-                        if ps_btn.clicked() {
-                            crate::tools::open_terminal_in_dir(&cwd_str, true);
+                        #[cfg(windows)]
+                        {
+                            let ps_btn = ui.button("⚡ PowerShell").on_hover_text(if is_de {
+                                "PowerShell in diesem Ordner öffnen"
+                            } else {
+                                "Open PowerShell in this folder"
+                            });
+                            if ps_btn.has_focus() { ps_btn.surrender_focus(); }
+                            if ps_btn.clicked() {
+                                crate::tools::open_terminal_in_dir(&cwd_str, true);
+                            }
+                            let cmd_btn = ui.button("🖳 CMD").on_hover_text(if is_de {
+                                "Eingabeaufforderung (cmd.exe) in diesem Ordner öffnen"
+                            } else {
+                                "Open Command Prompt (cmd.exe) in this folder"
+                            });
+                            if cmd_btn.has_focus() { cmd_btn.surrender_focus(); }
+                            if cmd_btn.clicked() {
+                                crate::tools::open_terminal_in_dir(&cwd_str, false);
+                            }
                         }
-                        let cmd_btn = ui.button("🖳 CMD").on_hover_text(if is_de {
-                            "Eingabeaufforderung (cmd.exe) in diesem Ordner öffnen"
-                        } else {
-                            "Open Command Prompt (cmd.exe) in this folder"
-                        });
-                        if cmd_btn.has_focus() { cmd_btn.surrender_focus(); }
-                        if cmd_btn.clicked() {
-                            crate::tools::open_terminal_in_dir(&cwd_str, false);
+                        #[cfg(not(windows))]
+                        {
+                            let term_btn = ui.button("💻 Terminal").on_hover_text(if is_de {
+                                "Standard-Terminal in diesem Ordner öffnen"
+                            } else {
+                                "Open Terminal in this folder"
+                            });
+                            if term_btn.has_focus() { term_btn.surrender_focus(); }
+                            if term_btn.clicked() {
+                                crate::tools::open_terminal_in_dir(&cwd_str, false);
+                            }
                         }
                         let run_clicked = ui.button(if is_de { "▶ Ausführen" } else { "▶ Run" }).clicked();
                         let cmd_edit = ui.add_sized(
@@ -5228,15 +5248,35 @@ impl FaroCommander {
         }
     }
 
-    fn get_windows_drives() -> Vec<String> {
-        let mut drives = Vec::new();
-        for drive_letter in b'A'..=b'Z' {
-            let path = format!("{}:\\", drive_letter as char);
-            if std::path::Path::new(&path).exists() {
-                drives.push(path);
+    fn get_drive_or_mount_buttons() -> Vec<(String, PathBuf)> {
+        #[cfg(windows)]
+        {
+            let mut drives = Vec::new();
+            for drive_letter in b'A'..=b'Z' {
+                let path = format!("{}:\\", drive_letter as char);
+                if std::path::Path::new(&path).exists() {
+                    let label = format!("{}:", drive_letter as char);
+                    drives.push((label, PathBuf::from(path)));
+                }
             }
+            drives
         }
-        drives
+        #[cfg(not(windows))]
+        {
+            let mut mounts = vec![
+                ("/".to_string(), PathBuf::from("/")),
+            ];
+            if let Ok(home) = std::env::var("HOME") {
+                mounts.push(("~".to_string(), PathBuf::from(home)));
+            }
+            for candidate in ["/mnt", "/media", "/home", "/tmp"] {
+                let p = PathBuf::from(candidate);
+                if p.is_dir() {
+                    mounts.push((candidate.to_string(), p));
+                }
+            }
+            mounts
+        }
     }
 
     fn render_pane(&mut self, ui: &mut egui::Ui, is_left: bool, ctx: &egui::Context) {
@@ -5374,15 +5414,15 @@ impl FaroCommander {
                             ui.spinner();
                         }
                     } else {
-                        // Dynamic Windows Drives (immediately surrender focus so Space/Enter never re-triggers drive button)
-                        for drive in Self::get_windows_drives() {
-                            let btn = ui.button(&drive[0..2]).on_hover_text(&drive);
+                        // Dynamic Drives / Mount Points (surrender focus so Space/Enter never re-triggers button)
+                        for (label, path) in Self::get_drive_or_mount_buttons() {
+                            let btn = ui.button(&label).on_hover_text(path.to_string_lossy());
                             if btn.has_focus() {
                                 btn.surrender_focus();
                             }
                             if btn.clicked() {
                                 self.active_pane_is_left = is_left;
-                                pane.navigate_to(PathBuf::from(&drive));
+                                pane.navigate_to(path);
                             }
                         }
                     }
